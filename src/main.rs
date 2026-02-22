@@ -16,6 +16,7 @@ use config::{DeepTimeSimulation, SimulationConfig};
 use nutrients::pools::NutrientColumn;
 use nutrients::solver::{BiogeochemSolver, ColumnEnv, update_column};
 use nutrients::pedogenesis::{PedogenesisSolver, PedogenesisParams, PedogenesisState};
+use image::{ImageBuffer, Rgb}; // Added for PNG export
 
 fn main() {
     println!("═══════════════════════════════════════════════════════════════");
@@ -140,6 +141,37 @@ fn main() {
                 format!("{:.1}ka", elapsed_ky),
                 max_h, mean_h, mean_p, mean_k, mean_s, reg_pct,
             );
+
+            // ==========================================
+            // PNG VISUALIZATION EXPORT
+            // ==========================================
+            let w = sim.config.grid_width;
+            let h = sim.config.grid_height;
+            
+            // 1. Export Elevation/Terrain Map
+            let file_elev = format!("terrain_epoch_{:03}.png", epoch);
+            export_grid_to_png(
+                &file_elev, w, h, &sim.heights, 
+                sim.config.sea_level_m, max_h, true
+            );
+
+            // 2. Export Soil Development (S) Heatmap
+            let file_soil = format!("soil_epoch_{:03}.png", epoch);
+            let soil_array: Vec<f32> = pedo_states.iter().map(|p| p.s).collect();
+            export_grid_to_png(
+                &file_soil, w, h, &soil_array, 
+                0.0, 1.0, false
+            );
+            
+            // 3. Export Phosphorous (P_labile) Heatmap
+            let file_p = format!("phosphorous_epoch_{:03}.png", epoch);
+            let p_array: Vec<f32> = nutrient_columns.iter().map(|c| c.surface_p_labile()).collect();
+            let max_p = p_array.iter().cloned().fold(0./0., f32::max);
+            export_grid_to_png(
+                &file_p, w, h, &p_array, 
+                0.0, max_p, false
+            );
+            // ==========================================
         }
 
         if epoch == n_epochs / 2 {
@@ -256,4 +288,56 @@ fn demo_maya_collapse() {
         col.surface_p_labile(), col.surface_k_exch(), gm,
         if gm > 0.4 { "Recovery underway" } else { "Still collapsed" }
     );
+}
+
+/// Renders a 1D flat array (e.g., heights or soil data) to a PNG file.
+fn export_grid_to_png(
+    filename: &str,
+    width: usize,
+    height: usize,
+    data: &[f32],
+    sea_level: f32,
+    max_val: f32,
+    is_terrain: bool,
+) {
+    let mut img = ImageBuffer::new(width as u32, height as u32);
+
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        // Your ECS world stores columns in a flat y * width + x layout
+        let idx = (y as usize) * width + (x as usize);
+        let val = data[idx];
+
+        let rgb = if is_terrain {
+            // TERRAIN COLOR MAPPING
+            if val <= sea_level {
+                let depth = ((sea_level - val) / 100.0).clamp(0.0, 1.0);
+                let b = (255.0 - depth * 100.0) as u8;
+                Rgb([0, 105, b]) // Deep water to shallow water
+            } else {
+                let norm = ((val - sea_level) / (max_val - sea_level).max(1.0)).clamp(0.0, 1.0);
+                if norm < 0.05 {
+                    Rgb([194, 178, 128]) // Sand/Beach
+                } else if norm < 0.4 {
+                    let g = (200.0 - norm * 150.0) as u8;
+                    Rgb([34, g, 34])     // Vegetation
+                } else if norm < 0.7 {
+                    let v = (100.0 + norm * 100.0) as u8;
+                    Rgb([v, v, v])       // Rock
+                } else {
+                    Rgb([240, 240, 255]) // Snow caps
+                }
+            }
+        } else {
+            // GENERIC HEATMAP (e.g., for Soil Development or Nutrients)
+            let norm = (val / max_val.max(0.001)).clamp(0.0, 1.0);
+            let c = (norm * 255.0) as u8;
+            Rgb([c, 0, 255 - c]) // Blue to Red heatmap
+        };
+
+        *pixel = rgb;
+    }
+
+    if let Err(e) = img.save(filename) {
+        eprintln!("Failed to save {}: {}", filename, e);
+    }
 }
