@@ -84,9 +84,7 @@ fn update_stratometer_text(
     macro_rules! set_text {
         ($query:expr, $val:expr) => {
             if let Ok(mut t) = $query.get_single_mut() {
-                if !t.sections.is_empty() {
-                    t.sections[0].value = $val;
-                }
+                t.0 = $val;
             }
         };
     }

@@ -33,14 +33,14 @@ features = [
     "bevy_core_pipeline",
     "bevy_render",
     "bevy_winit",
+    # 3D Rendering (Fixes MeshMaterial3d and StandardMaterial)
+    "bevy_pbr",       
     # Windowing backend
     "x11",            # Linux X11
     # Useful utilities
     "bevy_ui",
     "bevy_text",
     "bevy_sprite",
-    # For diagnostics overlay
-    "bevy_diagnostic",
 ]
 
 [profile.release]
