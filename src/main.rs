@@ -8,6 +8,7 @@ pub mod compute;
 pub mod climate;
 pub mod geology;
 pub mod soil;
+pub mod hydrology;
 pub mod world;
 pub mod diag;
 pub mod viz;
@@ -59,6 +60,7 @@ fn main() {
         tectonic,
         kf_base: 1e-5,
         kd_base: 0.01,
+        hydrology_config: crate::hydrology::HydrologyConfig::default(),
     };
 
     // ------------------------------------------------------------------

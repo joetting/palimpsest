@@ -1,26 +1,36 @@
-/// World Simulation Orchestrator
+/// World Simulation Orchestrator — Hydrologically Coupled
 ///
-/// Wires together all solver subsystems into a single epoch step:
+/// Epoch pipeline (reordered for proper water coupling):
 ///
-///   Heightmap ──► FastScape (geology) ──► Climate (thermostat + orographic + carbon)
-///       │                │                      │
-///       │                ▼                      ▼
-///       │         Pedogenesis ◄──────── Biome/veg data
-///       │           │   │
-///       │           ▼   ▼
-///       │      kf_mod  kd_mod ──► fed back into FastScape
-///       │
-///       └──► Nutrients (biogeochem P/K cycling)
-///                  │
-///                  ▼
-///            growth_multipliers ──► fed back into Pedogenesis + Climate
-///
-/// The LOD manager sits above this: the world simulation operates on the
-/// global 2.5D heightmap. The SVO is instantiated separately for the local zone.
+///   ┌─────────────────────────────────────────────────────────────────┐
+///   │ 1. CLIMATE (orographic)                                        │
+///   │    Elevation → precipitation, PET, temperature per cell         │
+///   │                     │                                          │
+///   │ 2. GEOLOGY (FastScape with precip-weighted drainage)           │
+///   │    Precipitation → drainage accumulation → erosion/deposition  │
+///   │                     │                                          │
+///   │ 3. HYDROLOGY                                                   │
+///   │    Precip + PET + drainage + slopes →                          │
+///   │      runoff, soil moisture, water table, flood detection       │
+///   │                     │                                          │
+///   │ 4. CARBON CYCLE (runoff-coupled weathering)                    │
+///   │    Runoff + moisture + erosion → CO₂ drawdown → thermostat     │
+///   │                     │                                          │
+///   │ 5. PEDOGENESIS (hydro-driven erosion intensity)                │
+///   │    Soil moisture + erosion → soil S → kf/kd modulation         │
+///   │                     │                                          │
+///   │ 6. NUTRIENTS (hydro-driven moisture, runoff, floods)           │
+///   │    Real runoff + TWI moisture + flood P → P/K cycling          │
+///   │                     │                                          │
+///   │ 7. FEEDBACK                                                    │
+///   │    growth_multipliers → pedogenesis + climate next epoch       │
+///   │    kf/kd → FastScape next epoch                                │
+///   └─────────────────────────────────────────────────────────────────┘
 
 use crate::climate::{ClimateConfig, ClimateEngine, WindParams};
 use crate::compute::activity_mask::ActivityProcessor;
 use crate::geology::{FastScapeSolver, SplParams, TectonicForcing};
+use crate::hydrology::{HydrologySolver, HydrologyConfig};
 use crate::soil::{
     BiogeochemSolver, ColumnEnv, NutrientColumn,
     PedogenesisParams, PedogenesisSolver, PedogenesisState,
@@ -38,10 +48,9 @@ pub struct WorldConfig {
     pub climate_config: ClimateConfig,
     pub wind_params: WindParams,
     pub tectonic: TectonicForcing,
-    /// Base erodibility coefficient (before pedogenesis modulation).
     pub kf_base: f32,
-    /// Base diffusion coefficient (before pedogenesis modulation).
     pub kd_base: f32,
+    pub hydrology_config: HydrologyConfig,
 }
 
 impl Default for WorldConfig {
@@ -58,6 +67,7 @@ impl Default for WorldConfig {
             tectonic: TectonicForcing::new(0.001),
             kf_base: 1e-5,
             kd_base: 0.01,
+            hydrology_config: HydrologyConfig::default(),
         }
     }
 }
@@ -76,6 +86,12 @@ pub struct EpochReport {
     pub mean_k_exch: f32,
     pub total_erosion_flux: f32,
     pub climate_summary: String,
+    // Hydrology diagnostics
+    pub mean_runoff: f32,
+    pub mean_soil_moisture: f32,
+    pub flooded_cells: usize,
+    pub max_discharge: f32,
+    pub mean_water_table: f32,
 }
 
 impl std::fmt::Display for EpochReport {
@@ -83,11 +99,14 @@ impl std::fmt::Display for EpochReport {
         write!(
             f,
             "[Epoch {:>4}] dt={:.0}yr  elev={:.0}/{:.0}m  CO₂={:.0}ppm  T={:.1}°C  \
-             soil={:.3}  P={:.1}  K={:.1}  erosion_flux={:.1}",
+             soil={:.3}  P={:.1}  K={:.1}  erosion={:.1}  \
+             runoff={:.3}m  moist={:.2}  flood={}  Q_max={:.0}  WT={:.1}m",
             self.epoch, self.dt_years, self.mean_elevation, self.max_elevation,
             self.co2_ppm, self.temperature_c,
             self.mean_soil_s, self.mean_p_labile, self.mean_k_exch,
             self.total_erosion_flux,
+            self.mean_runoff, self.mean_soil_moisture,
+            self.flooded_cells, self.max_discharge, self.mean_water_table,
         )
     }
 }
@@ -96,7 +115,7 @@ impl std::fmt::Display for EpochReport {
 pub struct WorldSimulation {
     pub config: WorldConfig,
 
-    // --- Core terrain data (the "global heightmap" data) ---
+    // --- Core terrain data ---
     pub elevations: Vec<f32>,
     pub delta_h: Vec<f32>,
     pub uplift: Vec<f32>,
@@ -106,6 +125,7 @@ pub struct WorldSimulation {
     // --- Solver engines ---
     pub fastscape: FastScapeSolver,
     pub climate: ClimateEngine,
+    pub hydrology: HydrologySolver,
     pub pedo_solver: PedogenesisSolver,
     pub pedo_states: Vec<PedogenesisState>,
     pub pedo_params: Vec<PedogenesisParams>,
@@ -119,7 +139,6 @@ pub struct WorldSimulation {
 }
 
 impl WorldSimulation {
-    /// Initialize the world from config + an initial elevation array.
     pub fn new(config: WorldConfig, initial_elevations: Vec<f32>) -> Self {
         let w = config.grid_width;
         let h = config.grid_height;
@@ -140,6 +159,11 @@ impl WorldSimulation {
             config.wind_params.clone(), config.cell_size_m,
         );
 
+        // Hydrology
+        let hydrology = HydrologySolver::new(
+            w, h, config.cell_size_m, config.hydrology_config.clone(),
+        );
+
         // Pedogenesis
         let pedo_solver = PedogenesisSolver::new(w, h);
         let pedo_states = pedo_solver.initialize(&initial_elevations, config.sea_level);
@@ -155,89 +179,140 @@ impl WorldSimulation {
                 } else if elev > config.sea_level {
                     NutrientColumn::new_alluvial(0.35)
                 } else {
-                    NutrientColumn::new_tropical(0.4) // ocean floor placeholder
+                    NutrientColumn::new_tropical(0.4)
                 }
             })
             .collect();
 
-        // Activity mask
         let activity = ActivityProcessor::new(w, h);
         let activity_mask = activity.all_land_active(&initial_elevations, config.sea_level);
 
         Self {
             elevations: initial_elevations,
             delta_h: vec![0.0; n],
-            uplift,
-            kf,
-            kd,
-            fastscape,
-            climate,
-            pedo_solver,
-            pedo_states,
-            pedo_params,
-            biogeo,
-            nutrient_columns,
-            activity,
-            activity_mask,
-            epoch: 0,
-            config,
+            uplift, kf, kd,
+            fastscape, climate, hydrology,
+            pedo_solver, pedo_states, pedo_params,
+            biogeo, nutrient_columns,
+            activity, activity_mask,
+            epoch: 0, config,
         }
     }
 
-    /// Run one epoch step: geology → climate → pedogenesis → nutrients → feedback.
+    /// Run one fully-coupled epoch step.
     pub fn step_epoch(&mut self) -> EpochReport {
         let dt = self.config.dt_years;
         let dt_f32 = dt as f32;
         let n = self.config.grid_width * self.config.grid_height;
+        let sea = self.config.sea_level;
 
         // ===================================================================
-        // 1. GEOLOGY: FastScape erosion + uplift + diffusion
+        // 1. CLIMATE: orographic precipitation + temperature
+        //    (Run first so we have per-cell precip for geology & hydrology)
         // ===================================================================
-        self.delta_h = self.fastscape.step_epoch(
+        let growth_mults = self.biogeo.growth_multipliers(&self.nutrient_columns);
+        let land_cells = self.elevations.iter().filter(|&&e| e > sea).count().max(1);
+        let plant_biomass: f32 = self.climate.columns.iter().enumerate()
+            .filter(|(i, _)| self.elevations[*i] > sea)
+            .map(|(i, col)| {
+                col.biome.veg_cover() * growth_mults.get(i).copied().unwrap_or(0.5)
+            }).sum::<f32>() / land_cells as f32;
+        let animal_respiration = plant_biomass * 0.12;
+
+        // Run orographic + lapse rate to get per-cell precipitation and PET
+        // (but don't update thermostat yet — need hydro runoff for that)
+        let oro = self.climate.orographic.compute(&self.elevations);
+        let base_temp = self.climate.thermostat.state.global_mean_temp_c;
+
+        // Collect per-cell precipitation and PET
+        let mut precipitation = vec![0.0f32; n];
+        let mut pet = vec![0.0f32; n];
+        for i in 0..n {
+            let elev = self.elevations[i];
+            let precip = oro.precipitation[i];
+            let temp = self.climate.lapse.local_temp(base_temp, elev);
+            precipitation[i] = precip;
+            pet[i] = self.climate.lapse.pet(temp);
+
+            // Update climate columns with current orographic data
+            let runoff = self.climate.lapse.runoff(precip, temp, elev);
+            let moisture = (runoff / precip.max(1e-6)).clamp(0.0, 1.0);
+            let biome = crate::climate::Biome::classify(temp, precip, elev);
+            self.climate.columns[i] = crate::climate::ColumnClimate {
+                temp_c: temp, precipitation_m: precip,
+                runoff_m: runoff, moisture, biome,
+            };
+        }
+
+        // ===================================================================
+        // 2. GEOLOGY: FastScape with precipitation-weighted drainage
+        //    (Wet slopes erode faster than dry slopes)
+        // ===================================================================
+        self.delta_h = self.fastscape.step_epoch_with_precip(
             &mut self.elevations,
             &self.uplift,
             &self.kf,
             &self.kd,
+            &precipitation,
             dt_f32,
         );
 
         // ===================================================================
-        // 2. CLIMATE: thermostat + orographic precipitation + carbon cycle
+        // 3. HYDROLOGY: compute water table, soil moisture, floods, runoff
+        //    from drainage network + precipitation + PET
         // ===================================================================
-        // Compute plant biomass proxy from nutrient growth multipliers.
-        // IMPORTANT: pass the per-cell MEAN, not the grid-wide sum.
-        // The thermostat coefficients expect a normalized biomass value.
-        let growth_mults = self.biogeo.growth_multipliers(&self.nutrient_columns);
-        let land_cells = self.elevations.iter()
-            .filter(|&&e| e > self.config.sea_level).count().max(1);
-        let plant_biomass: f32 = self.climate.columns.iter().enumerate()
-            .filter(|(i, _)| self.elevations[*i] > self.config.sea_level)
-            .map(|(i, col)| {
-                col.biome.veg_cover() * growth_mults.get(i).copied().unwrap_or(0.5)
-            }).sum::<f32>() / land_cells as f32;
+        self.hydrology.compute(
+            &precipitation,
+            &pet,
+            &self.elevations,
+            self.fastscape.drainage_area(),
+            self.fastscape.slopes(),
+            self.fastscape.receivers(),
+            &self.delta_h,
+            sea,
+        );
 
-        // Animal respiration scales with biomass: herbivores consume ~10-15%
-        // of net primary production, respiring most of it back as CO₂.
-        let animal_respiration = plant_biomass * 0.12;
+        // Extract hydro arrays for downstream consumers
+        let hydro_runoff: Vec<f32> = self.hydrology.cells.iter().map(|c| c.runoff_m).collect();
+        let hydro_moisture: Vec<f32> = self.hydrology.cells.iter().map(|c| c.soil_moisture).collect();
 
-        // Sub-step the climate to prevent overshoot at large dt.
-        // The thermostat is an ODE; stepping 5000yr at once overshoots equilibrium.
+        // ===================================================================
+        // 4. CARBON CYCLE: runoff-coupled silicate weathering → thermostat
+        //    (Wet climates weather faster, drawing down more CO₂)
+        // ===================================================================
         let climate_substeps = ((dt / 500.0).ceil() as usize).max(1);
         let climate_sub_dt = dt / climate_substeps as f64;
         for _ in 0..climate_substeps {
-            self.climate.step_epoch(
+            let fluxes = self.climate.carbon.compute_fluxes_hydro(
                 &self.elevations, &self.delta_h,
-                plant_biomass, animal_respiration, climate_sub_dt,
+                &hydro_runoff, &hydro_moisture,
+                self.config.grid_width, self.config.grid_height,
+                &self.climate.thermostat.state,
+            );
+            self.climate.thermostat.step_epoch(
+                plant_biomass, animal_respiration,
+                fluxes.silicate_drawdown, fluxes.organic_burial,
+                fluxes.anthropogenic_flush, climate_sub_dt,
             );
         }
 
         // ===================================================================
-        // 3. PEDOGENESIS: soil formation ↔ erosion feedback
+        // 5. PEDOGENESIS: soil formation ↔ erosion, using hydro moisture
         // ===================================================================
-        // Build pedogenesis environments from climate + erosion data.
-        let pedo_envs = self.pedo_solver.build_envs(
-            &growth_mults, &self.delta_h, self.config.cell_size_m,
-        );
+        let pedo_envs: Vec<crate::soil::PedoEnv> = (0..n).map(|i| {
+            let gm = growth_mults.get(i).copied().unwrap_or(0.5);
+            let dh = self.delta_h[i];
+            let hydro = &self.hydrology.cells[i];
+            // Erosion intensity from actual delta_h, amplified by runoff
+            let erosion_intensity = (dh.abs() / self.config.cell_size_m * 1000.0).min(1.0);
+            // Vegetation cover driven by moisture availability
+            let veg_cover = (gm * 1.2 * hydro.soil_moisture.max(0.1)).min(1.0);
+            crate::soil::PedoEnv {
+                veg_cover,
+                growth_multiplier: gm * hydro.soil_moisture.max(0.2),
+                erosion_intensity,
+            }
+        }).collect();
 
         let (kf_mod, kd_mod) = self.pedo_solver.step_epoch(
             &mut self.pedo_states,
@@ -247,46 +322,34 @@ impl WorldSimulation {
             &vec![self.config.kd_base; n],
             dt,
         );
-
-        // Feed pedogenesis-modulated erodibility back for next epoch.
         self.kf = kf_mod;
         self.kd = kd_mod;
 
         // ===================================================================
-        // 4. NUTRIENTS: biogeochemical P/K cycling
+        // 6. NUTRIENTS: P/K cycling driven by real hydrology
+        //    (Soil moisture, runoff, flood status all from hydrology solver)
         // ===================================================================
-        let nutrient_envs: Vec<ColumnEnv> = (0..n)
-            .map(|i| {
-                let col = &self.climate.columns[i];
-                let elev = self.elevations[i];
-                let dh = self.delta_h[i];
-                let flooded = dh > 0.05 && elev < self.config.sea_level + 50.0;
-                ColumnEnv {
-                    temp_c: col.temp_c,
-                    moisture: col.moisture,
-                    runoff_m_yr: col.runoff_m,
-                    flooded,
-                    flood_p_input: if flooded { 8.0 } else { 0.0 },
-                    delta_h_m: dh,
-                    veg_cover: col.biome.veg_cover(),
-                }
-            })
-            .collect();
+        let nutrient_envs: Vec<ColumnEnv> = (0..n).map(|i| {
+            let col = &self.climate.columns[i];
+            let hydro = &self.hydrology.cells[i];
+            ColumnEnv {
+                temp_c: col.temp_c,
+                moisture: hydro.soil_moisture,         // from TWI + water balance
+                runoff_m_yr: hydro.runoff_m,           // from Budyko curve
+                flooded: hydro.flooded,                // from discharge threshold
+                flood_p_input: hydro.flood_p_input,    // from upstream erosion
+                delta_h_m: self.delta_h[i],
+                veg_cover: col.biome.veg_cover(),
+            }
+        }).collect();
 
         self.biogeo.step_epoch(&mut self.nutrient_columns, &nutrient_envs, dt);
-
-        // Update activity mask (cells may sink below sea level).
-        self.activity_mask = self.activity.all_land_active(&self.elevations, self.config.sea_level);
+        self.activity_mask = self.activity.all_land_active(&self.elevations, sea);
 
         // ===================================================================
-        // 5. DIAGNOSTICS
+        // 7. DIAGNOSTICS
         // ===================================================================
         self.epoch += 1;
-
-        let mean_soil = self.pedo_solver.mean_s(&self.pedo_states);
-        let mean_p = self.biogeo.mean_surface_p_labile(&self.nutrient_columns, &self.activity_mask);
-        let mean_k = self.biogeo.mean_surface_k_exch(&self.nutrient_columns, &self.activity_mask);
-        let total_erosion = self.fastscape.total_erosion_flux(&self.delta_h, dt_f32);
 
         EpochReport {
             epoch: self.epoch,
@@ -295,25 +358,27 @@ impl WorldSimulation {
             mean_elevation: self.fastscape.mean_elevation(&self.elevations),
             co2_ppm: self.climate.thermostat.state.atmospheric_co2_ppm,
             temperature_c: self.climate.thermostat.state.global_mean_temp_c,
-            mean_soil_s: mean_soil,
-            mean_p_labile: mean_p,
-            mean_k_exch: mean_k,
-            total_erosion_flux: total_erosion,
+            mean_soil_s: self.pedo_solver.mean_s(&self.pedo_states),
+            mean_p_labile: self.biogeo.mean_surface_p_labile(&self.nutrient_columns, &self.activity_mask),
+            mean_k_exch: self.biogeo.mean_surface_k_exch(&self.nutrient_columns, &self.activity_mask),
+            total_erosion_flux: self.fastscape.total_erosion_flux(&self.delta_h, dt_f32),
             climate_summary: self.climate.summary(),
+            mean_runoff: self.hydrology.mean_runoff(),
+            mean_soil_moisture: self.hydrology.mean_soil_moisture(),
+            flooded_cells: self.hydrology.flooded_count(),
+            max_discharge: self.hydrology.max_discharge(),
+            mean_water_table: self.hydrology.mean_water_table(),
         }
     }
 
-    /// Run multiple epochs, returning reports.
     pub fn run(&mut self, n_epochs: usize) -> Vec<EpochReport> {
         (0..n_epochs).map(|_| self.step_epoch()).collect()
     }
 
-    /// Elder God CO₂ injection (direct climate manipulation).
     pub fn inject_co2(&mut self, delta_ppm: f32) {
         self.climate.thermostat.elder_god_co2_injection(delta_ppm);
     }
 
-    /// Update tectonic forcing (e.g., add a new hotspot mid-simulation).
     pub fn update_tectonics(&mut self, tectonic: TectonicForcing) {
         self.config.tectonic = tectonic.clone();
         self.uplift = tectonic.uplift_array(

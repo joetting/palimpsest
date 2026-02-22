@@ -68,6 +68,41 @@ impl FastScapeSolver {
             if r!=usize::MAX { let ai=self.drainage[i]; self.drainage[r]+=ai; }
         }
     }
+    /// Precipitation-weighted drainage accumulation.
+    /// Instead of uniform cell_area, each cell contributes precip_m * cell_area,
+    /// giving effective discharge Q = sum(P * A) along the flow network.
+    /// This couples orographic rainfall directly to erosion intensity.
+    pub fn accumulate_drainage_weighted(&mut self, precipitation: &[f32]) {
+        let cell_area = self.params.cell_size * self.params.cell_size;
+        let n = self.n_nodes();
+        for i in 0..n {
+            // Seed: local runoff contribution = precipitation * cell_area
+            // Cells with no precipitation contribute only cell_area (base flow)
+            let precip = precipitation.get(i).copied().unwrap_or(self.params.rainfall);
+            self.drainage[i] = precip.max(0.01) * cell_area;
+        }
+        for &i in &self.stack {
+            let r = self.receivers[i];
+            if r != usize::MAX {
+                let ai = self.drainage[i];
+                self.drainage[r] += ai;
+            }
+        }
+    }
+    /// Full epoch step with spatially-varying precipitation driving drainage.
+    /// This is the hydrologically-coupled version of step_epoch.
+    pub fn step_epoch_with_precip(
+        &mut self, h: &mut Vec<f32>, uplift: &[f32], kf: &[f32], kd: &[f32],
+        precipitation: &[f32], dt: f32,
+    ) -> Vec<f32> {
+        let h_before = h.clone();
+        self.route_flow(h);
+        self.compute_stack();
+        self.accumulate_drainage_weighted(precipitation);
+        self.solve_incision(h, uplift, kf, dt);
+        self.apply_diffusion(h, kd, dt);
+        h.iter().zip(h_before.iter()).map(|(new, old)| new - old).collect()
+    }
     pub fn solve_incision(&self,h:&mut Vec<f32>,uplift:&[f32],kf:&[f32],dt:f32) {
         let n=self.params.n; let m=self.params.m; let cell=self.params.cell_size;
         for i in 0..h.len() { h[i]+=uplift[i]*dt; }
@@ -122,6 +157,7 @@ impl FastScapeSolver {
     }
     pub fn drainage_area(&self) -> &[f32] { &self.drainage }
     pub fn receivers(&self) -> &[usize] { &self.receivers }
+    pub fn slopes(&self) -> &[f32] { &self.slope }
 }
 #[derive(Debug, Clone)]
 pub struct TectonicForcing { pub base_uplift:f32, pub hotspots:Vec<UpliftHotspot> }

@@ -240,6 +240,84 @@ pub fn render_global_erosion(world: &WorldSimulation, path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Hydrology renders
+// ---------------------------------------------------------------------------
+
+pub fn render_global_discharge(world: &WorldSimulation, path: &Path) {
+    let w = world.config.grid_width;
+    let h = world.config.grid_height;
+    let max_q = world.hydrology.max_discharge().max(1.0);
+
+    let mut img = RgbImage::new(w as u32, h as u32);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let q = world.hydrology.cells[idx].discharge_m3;
+            // Log scale for discharge (spans many orders of magnitude)
+            let t = (q.max(1.0).log10() / max_q.log10()).clamp(0.0, 1.0);
+            let color = if world.elevations[idx] <= world.config.sea_level {
+                Rgb([20, 40, 100])
+            } else if t > 0.3 {
+                // River channels: white→cyan scale
+                let s = ((t - 0.3) / 0.7).clamp(0.0, 1.0);
+                Rgb([
+                    (40.0 + 200.0 * s) as u8,
+                    (60.0 + 195.0 * s) as u8,
+                    (120.0 + 135.0 * s) as u8,
+                ])
+            } else {
+                // Low drainage: dark terrain
+                let s = t / 0.3;
+                Rgb([(30.0 + 20.0 * s) as u8, (40.0 + 30.0 * s) as u8, (30.0 + 40.0 * s) as u8])
+            };
+            img.put_pixel(x as u32, y as u32, color);
+        }
+    }
+    img.save(path).expect("Failed to save discharge PNG");
+}
+
+pub fn render_global_moisture(world: &WorldSimulation, path: &Path) {
+    let w = world.config.grid_width;
+    let h = world.config.grid_height;
+
+    let mut img = RgbImage::new(w as u32, h as u32);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let m = world.hydrology.cells[idx].soil_moisture;
+            let color = if world.elevations[idx] <= world.config.sea_level {
+                Rgb([20, 40, 100])
+            } else {
+                scalar_color(m, 0.0, 1.0, Rgb([180, 140, 80]), Rgb([20, 80, 160]))
+            };
+            img.put_pixel(x as u32, y as u32, color);
+        }
+    }
+    img.save(path).expect("Failed to save moisture PNG");
+}
+
+pub fn render_global_water_table(world: &WorldSimulation, path: &Path) {
+    let w = world.config.grid_width;
+    let h = world.config.grid_height;
+
+    let mut img = RgbImage::new(w as u32, h as u32);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let wt = world.hydrology.cells[idx].water_table_depth_m;
+            let color = if world.elevations[idx] <= world.config.sea_level {
+                Rgb([20, 40, 100])
+            } else {
+                // 0m (shallow/wet) = blue, 30m (deep/dry) = brown
+                scalar_color(wt, 0.0, 30.0, Rgb([30, 80, 180]), Rgb([160, 120, 60]))
+            };
+            img.put_pixel(x as u32, y as u32, color);
+        }
+    }
+    img.save(path).expect("Failed to save water table PNG");
+}
+
+// ---------------------------------------------------------------------------
 // Local SVO cross-section render
 // ---------------------------------------------------------------------------
 
@@ -327,6 +405,9 @@ pub fn render_epoch(
     render_global_soil(world, &output_dir.join(format!("epoch_{:04}_soil.png", epoch)));
     render_global_nutrients(world, &output_dir.join(format!("epoch_{:04}_nutrients.png", epoch)));
     render_global_erosion(world, &output_dir.join(format!("epoch_{:04}_erosion.png", epoch)));
+    render_global_discharge(world, &output_dir.join(format!("epoch_{:04}_discharge.png", epoch)));
+    render_global_moisture(world, &output_dir.join(format!("epoch_{:04}_moisture.png", epoch)));
+    render_global_water_table(world, &output_dir.join(format!("epoch_{:04}_watertable.png", epoch)));
 
     // Local SVO slices (if loaded)
     if let Some(svo) = svo {

@@ -8,7 +8,6 @@ pub fn trace_co2_budget(world: &mut WorldSimulation) {
     let c = &world.climate.thermostat.config;
     let state = &world.climate.thermostat.state;
     
-    // Compute the same values the thermostat will use
     let growth_mults = world.biogeo.growth_multipliers(&world.nutrient_columns);
     let land_cells = world.elevations.iter()
         .filter(|&&e| e > world.config.sea_level).count().max(1);
@@ -18,10 +17,13 @@ pub fn trace_co2_budget(world: &mut WorldSimulation) {
             col.biome.veg_cover() * growth_mults.get(i).copied().unwrap_or(0.5)
         }).sum::<f32>() / land_cells as f32;
     let animal_respiration = plant_biomass * 0.12;
-    
-    // Carbon cycle fluxes
-    let fluxes = world.climate.carbon.compute_fluxes(
+
+    // Use hydro-coupled fluxes if available
+    let hydro_runoff: Vec<f32> = world.hydrology.cells.iter().map(|c| c.runoff_m).collect();
+    let hydro_moisture: Vec<f32> = world.hydrology.cells.iter().map(|c| c.soil_moisture).collect();
+    let fluxes = world.climate.carbon.compute_fluxes_hydro(
         &world.elevations, &world.delta_h,
+        &hydro_runoff, &hydro_moisture,
         world.config.grid_width, world.config.grid_height,
         state,
     );

@@ -129,6 +129,38 @@ impl ClimateEngine {
 
     pub fn summary(&self) -> String { self.thermostat.state.summary() }
 
+    /// Hydrology-coupled epoch step. Uses per-cell runoff and soil moisture
+    /// from the hydrology solver for physically-based silicate weathering.
+    pub fn step_epoch_hydro(
+        &mut self, elevations: &[f32], delta_h: &[f32],
+        runoff: &[f32], soil_moisture: &[f32],
+        plant_biomass_total: f32, animal_respiration: f32, dt_years: f64,
+    ) {
+        let fluxes = self.carbon.compute_fluxes_hydro(
+            elevations, delta_h, runoff, soil_moisture,
+            self.grid_width, self.grid_height, &self.thermostat.state,
+        );
+        self.thermostat.step_epoch(
+            plant_biomass_total, animal_respiration,
+            fluxes.silicate_drawdown, fluxes.organic_burial,
+            fluxes.anthropogenic_flush, dt_years,
+        );
+        let oro = self.orographic.compute(elevations);
+        let base_temp = self.thermostat.state.global_mean_temp_c;
+        for idx in 0..(self.grid_width * self.grid_height) {
+            let elev = elevations[idx];
+            let precip = oro.precipitation[idx];
+            let temp = self.lapse.local_temp(base_temp, elev);
+            let cell_runoff = self.lapse.runoff(precip, temp, elev);
+            let moisture = (cell_runoff / precip.max(1e-6)).clamp(0.0, 1.0);
+            let biome = Biome::classify(temp, precip, elev);
+            self.columns[idx] = ColumnClimate {
+                temp_c: temp, precipitation_m: precip,
+                runoff_m: cell_runoff, moisture, biome,
+            };
+        }
+    }
+
     pub fn biome_counts(&self, elevations: &[f32], sea_level: f32) -> [(Biome, usize); 8] {
         let mut counts = [0usize; 8];
         for (i, col) in self.columns.iter().enumerate() {
