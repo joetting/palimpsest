@@ -284,7 +284,7 @@ impl FastScapeSolver {
                 for _ in 0..self.params.max_nr_iters {
                     let slope = ((h_new - hr) / dist).max(0.0);
                     let erosion = ki * a.powf(m) * slope.powf(n) * dt;
-                    let f_val = h_new - h_old + erosion - uplift[i] * dt;
+                    let f_val = h_new - h_old + erosion;
                     let df = 1.0 + ki * a.powf(m) * n * slope.powf(n - 1.0) * dt / dist;
                     let delta = f_val / df;
                     h_new -= delta;
