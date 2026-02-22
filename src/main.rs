@@ -1,8 +1,5 @@
 // ============================================================================
-// Deep Time Engine — Phase 2: Critical Zone
-//
-// Phase 1 (complete): ECS, FastScape, Strang, bitmask, cohorts, tectonic forcing
-// Phase 2 (this build): 9-pool P-K biogeochemistry + Phillips pedogenesis
+// Deep Time Engine — Phase 2: Critical Zone (Gentle Hills Configuration)
 // ============================================================================
 
 mod ecs;
@@ -16,7 +13,7 @@ use config::{DeepTimeSimulation, SimulationConfig};
 use nutrients::pools::NutrientColumn;
 use nutrients::solver::{BiogeochemSolver, ColumnEnv, update_column};
 use nutrients::pedogenesis::{PedogenesisSolver, PedogenesisParams, PedogenesisState};
-use image::{ImageBuffer, Rgb}; // Added for PNG export
+use image::{ImageBuffer, Rgb};
 
 fn main() {
     println!("═══════════════════════════════════════════════════════════════");
@@ -24,11 +21,12 @@ fn main() {
     println!("  Coupled P-K Biogeochemistry + Phillips Pedogenesis");
     println!("═══════════════════════════════════════════════════════════════\n");
 
+    // CONFIG MODIFIED FOR FLATTER LANDSCAPE
     let config = SimulationConfig {
         grid_width:      128,
         grid_height:     128,
         cell_size_m:     1_000.0,
-        max_elevation_m: 2_500.0,
+        max_elevation_m: 400.0, // Reduced from 2500.0 for a low-relief baseline
         sea_level_m:     0.0,
         geo_dt_years:    100.0,
         seed:            1984,
@@ -81,8 +79,27 @@ fn main() {
     // -------------------------------------------------------------------------
     // Coupled simulation loop
     // -------------------------------------------------------------------------
-    println!("\n[ELDER GOD] Adding tectonic hotspot (64,64)...");
-    sim.add_uplift_hotspot(64, 64, 25.0, 0.002);
+    println!("\n[ELDER GOD] Generating a field of rolling hills...");
+    
+    // Create a scattered grid of gentle hills across the landscape
+    let hill_centers = [
+        (30, 30), (98, 30), 
+        (64, 64), 
+        (30, 98), (98, 98),
+        (50, 90), (90, 50)
+    ];
+
+    for (x_idx, y_idx) in hill_centers.iter() {
+        // Pass the grid coordinates as u32 integers
+        let center_x = *x_idx as u32;
+        let center_y = *y_idx as u32;
+        
+        // Set a wide radius of 20km (20,000 meters)
+        let radius_m = 20_000.0; 
+        
+        // Apply a very gentle uplift rate (0.0003 m/yr)
+        sim.add_uplift_hotspot(center_x, center_y, radius_m, 0.0003);
+    }
 
     println!("\n[SIMULATION] Coupled terrain + biogeochemistry + pedogenesis\n");
     println!("  {:<8} {:<9} {:<9} {:<10} {:<10} {:<10} {:<10} {:<8}",
@@ -152,7 +169,7 @@ fn main() {
             let file_elev = format!("terrain_epoch_{:03}.png", epoch);
             export_grid_to_png(
                 &file_elev, w, h, &sim.heights, 
-                sim.config.sea_level_m, max_h, true
+                sim.config.sea_level_m, sim.config.max_elevation_m.max(2000.0), true // FIXED: Absolute coloring maxed out at 2000m to prevent flat hills from painting as snow
             );
 
             // 2. Export Soil Development (S) Heatmap
@@ -175,8 +192,9 @@ fn main() {
         }
 
         if epoch == n_epochs / 2 {
-            println!("\n  [ELDER GOD] Orogenic event! Erosion spike → soil reset → P loss...");
-            sim.add_uplift_hotspot(32, 96, 40.0, 0.005);
+            println!("\n  [ELDER GOD] Minor tectonic shift! Creating new low ridges...");
+            // Reduced from an aggressive 0.005 rate to a mild 0.0008
+            sim.add_uplift_hotspot(32, 96, 25.0, 0.0008); 
             println!();
         }
     }
@@ -196,29 +214,6 @@ fn main() {
     println!("\n================================================================");
     println!("  PHASE 2 COMPLETE — Critical Zone Architecture");
     println!("================================================================\n");
-    println!("  PHASE 1 (terrain):");
-    println!("  [x] ECS World            {} entities, SoA GPU-ready", sim.world.total_columns());
-    println!("  [x] FastScape Solver     O(N) implicit SPL, Newton-Raphson fixed");
-    println!("  [x] Strang Splitting     Social|Geo|Bio multirate schedules");
-    println!("  [x] Activity Bitmask     sparse GPU skip");
-    println!("  [x] Tectonic Forcing     {} active hotspots\n", sim.tectonics.hotspots.len());
-    println!("  PHASE 2 (biogeochemistry + pedogenesis):");
-    println!("  [x] 9-pool P-K ODE       Buendía P-cycle + K biocycling pump analogue");
-    println!("  [x] DEFAC scalar         Q10 temperature × moisture limitation");
-    println!("  [x] Strang ODE solver    analytical equilibrium fast + Euler slow");
-    println!("  [x] Vertical leaching    8-layer clay-retained cascade");
-    println!("  [x] Alluvial P renewal   flood-deposited P (Nile/Maya mechanic)");
-    println!("  [x] FastScape Δh piggyback erosion/deposition carries nutrients");
-    println!("  [x] Phillips pedogenesis dS/dt = c1·exp(-k1·S) - c2·exp(-k2/S)");
-    println!("  [x] Lyapunov tracking    soil divergence accumulator per column");
-    println!("  [x] S → Kf/Kd feedback  mature soil resists incision, promotes creep");
-    println!("  [x] Growth multiplier    Liebig min(f_P, f_K) for BDI agents\n");
-    println!("  Total sim time:  {}", sim.clock.summary());
-    println!("  Geo epochs run:  {}", sim.clock.geo_epoch);
-    println!("\n  NEXT -> Phase 3: Flesh & Genes");
-    println!("         BDI agents, Lotka-Volterra ecology, faunalturbation,");
-    println!("         plant-soil feedback, yield crisis → collapse cascade");
-    println!("================================================================");
 }
 
 fn print_nutrient_stats(
@@ -253,14 +248,12 @@ fn demo_maya_collapse() {
         col.surface_p_labile(), col.surface_k_exch(), col.column_growth_multiplier());
 
     for cycle in 1..=3 {
-        // 50 yr cultivation: bare soil, high runoff, no canopy P trapping
         let farm = ColumnEnv {
             temp_c: 26.0, moisture: 0.8, runoff_m_yr: 0.7,
             flooded: false, flood_p_input: 0.0, delta_h_m: 0.0, veg_cover: 0.05,
         };
         update_column(&mut col, &farm, 50.0);
 
-        // 20 yr fallow: partial regrowth
         let fallow = ColumnEnv { veg_cover: 0.4, ..farm };
         update_column(&mut col, &fallow, 20.0);
 
@@ -277,7 +270,6 @@ fn demo_maya_collapse() {
         );
     }
 
-    // Flood renewal — simulate river reconnection / dam removal
     let flood = ColumnEnv {
         flooded: true, flood_p_input: 12.0, veg_cover: 0.3,
         runoff_m_yr: 0.5, temp_c: 26.0, moisture: 0.9, delta_h_m: 0.1,
@@ -290,7 +282,68 @@ fn demo_maya_collapse() {
     );
 }
 
-/// Renders a 1D flat array (e.g., heights or soil data) to a PNG file.
+// ==========================================
+// PNG VISUALIZATION EXPORT HELPER FUNCTIONS
+// ==========================================
+
+/// Basic linear interpolation for a single float
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Interpolates smoothly between two RGB arrays
+fn lerp_rgb(c1: [u8; 3], c2: [u8; 3], t: f32) -> Rgb<u8> {
+    Rgb([
+        lerp(c1[0] as f32, c2[0] as f32, t) as u8,
+        lerp(c1[1] as f32, c2[1] as f32, t) as u8,
+        lerp(c1[2] as f32, c2[2] as f32, t) as u8,
+    ])
+}
+
+/// Generates a continuous Viridis colormap for heatmaps
+fn get_viridis(norm: f32) -> Rgb<u8> {
+    let t = norm.clamp(0.0, 1.0);
+    let stops = [
+        (0.00, [68, 1, 84]),     // Dark Purple
+        (0.25, [59, 82, 139]),   // Blue
+        (0.50, [33, 145, 140]),  // Teal
+        (0.75, [94, 201, 98]),   // Green
+        (1.00, [253, 231, 37]),  // Yellow
+    ];
+
+    for i in 0..stops.len() - 1 {
+        let (t1, c1) = stops[i];
+        let (t2, c2) = stops[i + 1];
+        if t <= t2 {
+            let local_t = (t - t1) / (t2 - t1);
+            return lerp_rgb(c1, c2, local_t);
+        }
+    }
+    Rgb(stops[4].1)
+}
+
+/// Generates a continuous topological colormap for terrain
+fn get_terrain_color(norm: f32) -> Rgb<u8> {
+    let t = norm.clamp(0.0, 1.0);
+    let stops = [
+        (0.00, [194, 178, 128]), // Sand/Beach
+        (0.15, [34, 139, 34]),   // Lowland Vegetation
+        (0.40, [85, 107, 47]),   // Highland Vegetation
+        (0.70, [120, 120, 120]), // Rock
+        (1.00, [240, 240, 255]), // Snow Caps
+    ];
+
+    for i in 0..stops.len() - 1 {
+        let (t1, c1) = stops[i];
+        let (t2, c2) = stops[i + 1];
+        if t <= t2 {
+            let local_t = (t - t1) / (t2 - t1);
+            return lerp_rgb(c1, c2, local_t);
+        }
+    }
+    Rgb(stops[4].1)
+}
+
 fn export_grid_to_png(
     filename: &str,
     width: usize,
@@ -303,35 +356,22 @@ fn export_grid_to_png(
     let mut img = ImageBuffer::new(width as u32, height as u32);
 
     for (x, y, pixel) in img.enumerate_pixels_mut() {
-        // Your ECS world stores columns in a flat y * width + x layout
         let idx = (y as usize) * width + (x as usize);
         let val = data[idx];
 
         let rgb = if is_terrain {
-            // TERRAIN COLOR MAPPING
             if val <= sea_level {
-                let depth = ((sea_level - val) / 100.0).clamp(0.0, 1.0);
-                let b = (255.0 - depth * 100.0) as u8;
-                Rgb([0, 105, b]) // Deep water to shallow water
+                let depth_norm = ((sea_level - val) / 100.0).clamp(0.0, 1.0);
+                // Continuous blend from Deep Ocean (dark blue) to Shallows (light blue)
+                lerp_rgb([0, 15, 80], [0, 105, 200], 1.0 - depth_norm)
             } else {
                 let norm = ((val - sea_level) / (max_val - sea_level).max(1.0)).clamp(0.0, 1.0);
-                if norm < 0.05 {
-                    Rgb([194, 178, 128]) // Sand/Beach
-                } else if norm < 0.4 {
-                    let g = (200.0 - norm * 150.0) as u8;
-                    Rgb([34, g, 34])     // Vegetation
-                } else if norm < 0.7 {
-                    let v = (100.0 + norm * 100.0) as u8;
-                    Rgb([v, v, v])       // Rock
-                } else {
-                    Rgb([240, 240, 255]) // Snow caps
-                }
+                get_terrain_color(norm)
             }
         } else {
-            // GENERIC HEATMAP (e.g., for Soil Development or Nutrients)
+            // Apply continuous Viridis mapping to non-terrain data (Soil, Phosphorus)
             let norm = (val / max_val.max(0.001)).clamp(0.0, 1.0);
-            let c = (norm * 255.0) as u8;
-            Rgb([c, 0, 255 - c]) // Blue to Red heatmap
+            get_viridis(norm)
         };
 
         *pixel = rgb;

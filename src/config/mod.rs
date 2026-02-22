@@ -29,7 +29,7 @@ impl Default for SimulationConfig {
             grid_width:      128,
             grid_height:     128,
             cell_size_m:     1_000.0,   // 1 km per cell
-            max_elevation_m: 3_000.0,   // max 3 km
+            max_elevation_m: 400.0,   // max 3 km
             sea_level_m:     0.0,
             geo_dt_years:    100.0,     // 100-year epochs
             seed:            42,
