@@ -7,14 +7,48 @@ edition = "2021"
 name = "deep_time_engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "bevy_sim"
+path = "src/bevy_main.rs"
+
 [dependencies]
-rayon = "=1.8.0"
-glam = "0.24"
-ndarray = "0.15"
-rand = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-image = "0.24"
+# Existing simulation deps
+rayon       = "=1.8.0"
+glam        = "0.24"
+ndarray     = "0.15"
+rand        = "0.8"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+image       = "0.24"
+
+# Bevy 0.15 — minimal feature set for headless-first development.
+# We disable audio/gltf/animation since we don't need them yet.
+# "bevy_render" and "bevy_winit" give us the window + WGPU context.
+[dependencies.bevy]
+version = "0.15"
+default-features = false
+features = [
+    # Core
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_render",
+    "bevy_winit",
+    # Windowing backend
+    "x11",            # Linux X11
+    # Useful utilities
+    "bevy_ui",
+    "bevy_text",
+    "bevy_sprite",
+    # For diagnostics overlay
+    "bevy_diagnostic",
+]
 
 [profile.release]
+opt-level = 3
+
+[profile.dev]
+# Bevy compiles very slowly in pure debug; this speeds it up significantly
+opt-level = 1
+
+[profile.dev.package."*"]
 opt-level = 3
