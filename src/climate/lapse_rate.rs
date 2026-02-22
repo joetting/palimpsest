@@ -15,7 +15,7 @@ impl LapseRateEngine {
         let temp_scale=(temp_c/15.0).max(0.0).min(3.0);
         self.et_reference*PT_ALPHA*temp_scale
     }
-    #[inline] pub fn runoff(&self,precip_m:f32,temp_c:f32,elevation_m:f32) -> f32 {
+    #[inline] pub fn runoff(&self,precip_m:f32,temp_c:f32,_elevation_m:f32) -> f32 {
         let snow_fraction=if temp_c<0.0{1.0}else{0.0};
         let liquid_precip=precip_m*(1.0-snow_fraction);
         let pet=self.pet(temp_c); let aet=pet.min(liquid_precip);

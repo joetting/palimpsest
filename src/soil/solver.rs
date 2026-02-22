@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use crate::nutrients::pools::{
+use crate::soil::pools::{
     NutrientColumn, NutrientLayer,
     K_W_P, PHI_P, K_OCC, K_MIN_P, K_LIT_P, K_UPTAKE_P, K_LEACH_P, P_TECTONIC_INPUT,
     K_W_K, K_FIX_BASE, K_REL, K_UPTAKE_K, K_LIT_K, K_LEACH_K, defac,
