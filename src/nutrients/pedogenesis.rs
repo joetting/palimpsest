@@ -15,10 +15,19 @@ impl PedogenesisState {
         let dt=dt_years as f32;
         let c1_eff=params.c1*env.veg_cover*env.growth_multiplier.max(0.1);
         let c2_eff=params.c2*(1.0+env.erosion_intensity*5.0);
-        self.compute_rates(c1_eff,params.k1,c2_eff,params.k2);
-        let ds_dt=self.dp_dt-self.dr_dt;
-        self.s=(self.s+ds_dt*dt).clamp(0.001,0.999);
-        self.lyapunov_acc+=(self.dp_dt-self.dr_dt).abs()*dt*0.001;
+        
+        // --- NEW SUB-STEPPING LOGIC ---
+        let max_dt = 10.0; // Maximum years per integration step
+        let steps = (dt / max_dt).ceil() as usize;
+        let step_dt = dt / (steps.max(1) as f32);
+
+        for _ in 0..steps {
+            self.compute_rates(c1_eff,params.k1,c2_eff,params.k2);
+            let ds_dt=self.dp_dt-self.dr_dt;
+            self.s=(self.s+ds_dt*step_dt).clamp(0.001,0.999);
+            self.lyapunov_acc+=(self.dp_dt-self.dr_dt).abs()*step_dt*0.001;
+        }
+        // ------------------------------
     }
     pub fn modulated_kf(&self,kf_base:f32) -> f32 { kf_base*(-BETA_F*self.s).exp() }
     pub fn modulated_kd(&self,kd_base:f32) -> f32 { kd_base*(1.0+BETA_D*self.s) }

@@ -56,9 +56,20 @@ impl CarbonCycleEngine {
                 (silicate_rate,burial,flush,erosion_active,erosion_m*1000.0)
             }).reduce(||(0.0f32,0.0f32,0.0f32,0usize,0.0f32),|a,b|(a.0+b.0,a.1+b.1,a.2+b.2,a.3+b.3,a.4+b.4));
         let mean_erosion=if erosion_count>0{erosion_sum/erosion_count as f32}else{0.0};
-        CarbonFluxes { silicate_drawdown:total_silicate,organic_burial:total_burial,
-            anthropogenic_flush:total_flush,active_erosion_cells:erosion_count,
-            mean_erosion_rate_mm_yr:mean_erosion,tectonic_contribution:total_silicate*0.6 }
+        
+        // --- NEW SCALING LOGIC ---
+        let earth_area_km2 = crate::math::constants::EARTH_CONTINENTAL_AREA_M2 as f32 / 1_000_000.0;
+        let grid_area_km2 = (n as f32) * self.cell_area_km2;
+        let area_scaling = earth_area_km2 / grid_area_km2.max(1.0);
+
+        CarbonFluxes { 
+            silicate_drawdown: total_silicate / area_scaling,
+            organic_burial: total_burial / area_scaling,
+            anthropogenic_flush: total_flush / area_scaling,
+            active_erosion_cells: erosion_count,
+            mean_erosion_rate_mm_yr: mean_erosion,
+            tectonic_contribution: (total_silicate * 0.6) / area_scaling 
+        }
     }
     pub fn estimate_uplift_drawdown(&self,radius_km:f32,rate_m_yr:f32) -> f32 {
         let area_km2=std::f32::consts::PI*radius_km*radius_km;
