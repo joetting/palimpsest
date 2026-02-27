@@ -1,17 +1,18 @@
-//! Erosion solvers with physically correct dual-layer substrate tracking.
+//! Erosion solvers with soil-state-coupled erodibility and diffusivity.
 //!
-//! **Critique fixes**:
-//! - #1a: Erosion now differentiates bedrock vs sediment. The solver first strips
-//!   loose sediment (fast, no K_f needed), then incises bedrock at rate K_f.
-//! - #1b: Added nonlinear Roering et al. (1999) hillslope diffusion for steep terrain.
-//! - #1c: Implicit ADI (Alternating Direction Implicit) diffusion solver eliminates
-//!   the CFL-induced sub-stepping bottleneck for high-resolution grids.
-//! - #4:  Biogeochemical pools (C, N) are advected with the sediment flux during
-//!   erosion and deposited proportionally.
-//! - #5:  Newton-Raphson uses adaptive iteration limits with convergence monitoring.
+//! **Solution #2 (On-the-fly K_f)**: Erodibility is computed as a pure function
+//! of soil_state S at each cell during the erosion kernel. No extra K_f array.
+//!   K_f_eff = K_f_base / (1 + α * S)
+//!
+//! **Solution #1 (Operator-Split Variable K_d)**: The implicit ADI solver uses
+//! a constant K_d_base for unconditional stability. The soil-induced variance
+//! ΔK_d(S) is applied as an explicit correction after the implicit step.
+//!   K_d_eff = K_d_base * (1 + β * S)
+//!   Explicit correction: Δh = dt * ΔK_d(S) * ∇²h
 
 use crate::grid::TerrainGrid;
 use crate::flow::FlowRoutingResult;
+use crate::pedogenesis;
 
 /// Parameters for the Stream Power Law erosion model.
 #[derive(Clone, Debug)]
@@ -26,6 +27,8 @@ pub struct StreamPowerParams {
     pub n: f64,
     /// Tectonic uplift rate U [m/yr]
     pub uplift_rate: f64,
+    /// Soil-state sensitivity for erodibility: K_f / (1 + alpha * S)
+    pub alpha_erodibility: f64,
 }
 
 impl Default for StreamPowerParams {
@@ -36,6 +39,7 @@ impl Default for StreamPowerParams {
             m: 0.5,
             n: 1.0,
             uplift_rate: 1e-3,
+            alpha_erodibility: 0.5,
         }
     }
 }
@@ -50,6 +54,7 @@ pub struct XiQParams {
     pub v_s: f64,
     pub d_star: f64,
     pub uplift_rate: f64,
+    pub alpha_erodibility: f64,
 }
 
 impl Default for XiQParams {
@@ -62,20 +67,12 @@ impl Default for XiQParams {
             v_s: 1.0,
             d_star: 1.0,
             uplift_rate: 1e-3,
+            alpha_erodibility: 0.5,
         }
     }
 }
 
-/// Implicit O(n) SPL solver with dual-layer substrate tracking.
-///
-/// **Critique fix #1a**: Erosion now correctly differentiates between removing
-/// loose sediment (using k_f_sed) and incising bedrock (using k_f). When
-/// sediment cover exists, the effective erodibility is the sediment value;
-/// once sediment is stripped, bedrock erodibility takes over.
-///
-/// **Critique fix #4**: When erosion removes sediment, the nutrients bound in
-/// that sediment (C, N per unit thickness) are mobilized into the sediment flux
-/// and deposited downstream proportionally.
+/// Implicit O(n) SPL solver with soil-state-modulated erodibility (Solution #2).
 pub fn implicit_spl_erode(
     grid: &mut TerrainGrid,
     routing: &FlowRoutingResult,
@@ -90,8 +87,9 @@ pub fn implicit_spl_erode(
     let mut bedrock: Vec<f64> = grid.bedrock.iter().copied().collect();
     let mut sediment: Vec<f64> = grid.sediment.iter().copied().collect();
     let discharge: Vec<f64> = grid.discharge.iter().copied().collect();
+    let soil_state: Vec<f64> = grid.soil_state.iter().copied().collect();
 
-    // Nutrient concentrations in sediment [kg/m² per m of sediment thickness]
+    // Nutrient tracking
     let mut c_conc: Vec<f64> = vec![0.0; n_nodes];
     let mut n_conc: Vec<f64> = vec![0.0; n_nodes];
     let mut c_flux: Vec<f64> = vec![0.0; n_nodes];
@@ -104,7 +102,7 @@ pub fn implicit_spl_erode(
         n_conc[i] = grid.soil_nitrogen[[r, c]] / sed_thick;
     }
 
-    // Apply uplift to interior nodes (raises bedrock)
+    // Apply uplift to interior nodes
     for i in 0..n_nodes {
         let (r, c) = grid.grid_index(i);
         if !grid.is_boundary(r, c) {
@@ -113,8 +111,9 @@ pub fn implicit_spl_erode(
         }
     }
 
-    // Process nodes in stack order (outlets first, then upstream)
+    // Process nodes in stack order
     if (params.n - 1.0).abs() < 1e-10 {
+        // Linear case
         for &node in routing.stack.iter() {
             let recv = routing.receivers[node];
             if recv == node { continue; }
@@ -123,32 +122,30 @@ pub fn implicit_spl_erode(
             let h_old = elev[node];
             let h_recv = elev[recv];
 
-            // Effective erodibility depends on whether we're cutting sediment or bedrock
+            // **Solution #2**: Compute K_f on-the-fly from soil state
             let k_eff = if sediment[node] > 0.01 {
-                params.k_f_sed
+                pedogenesis::effective_erodibility(
+                    params.k_f_sed, soil_state[node], params.alpha_erodibility)
             } else {
-                params.k_f
+                pedogenesis::effective_erodibility(
+                    params.k_f, soil_state[node], params.alpha_erodibility)
             };
 
             let factor = k_eff * q_m / dx;
             let h_new = (h_old + dt * factor * h_recv) / (1.0 + dt * factor);
             let h_new = h_new.max(h_recv);
 
-            let dh = h_old - h_new; // Total lowering (positive = erosion)
+            let dh = h_old - h_new;
 
-            // Partition erosion between sediment and bedrock
             if dh > 0.0 {
                 let sed_eroded = dh.min(sediment[node]);
                 let rock_eroded = (dh - sed_eroded).max(0.0);
-
                 sediment[node] -= sed_eroded;
                 bedrock[node] -= rock_eroded;
 
-                // Nutrient mobilization from eroded sediment
                 let c_mobilized = sed_eroded * c_conc[node];
                 let n_mobilized = sed_eroded * n_conc[node];
 
-                // Route nutrients to receiver
                 let frac = routing.flow_fraction[node];
                 c_flux[recv] += c_mobilized * frac * cell_area;
                 n_flux[recv] += n_mobilized * frac * cell_area;
@@ -164,7 +161,7 @@ pub fn implicit_spl_erode(
             grid.erosion_rate[[r, c]] = dh / dt;
         }
     } else {
-        // Nonlinear case: adaptive Newton-Raphson (critique fix #5)
+        // Nonlinear case: adaptive Newton-Raphson
         for &node in routing.stack.iter() {
             let recv = routing.receivers[node];
             if recv == node { continue; }
@@ -173,14 +170,18 @@ pub fn implicit_spl_erode(
             let h_recv = elev[recv];
             let h_old = elev[node];
 
-            let k_eff = if sediment[node] > 0.01 { params.k_f_sed } else { params.k_f };
+            let k_eff = if sediment[node] > 0.01 {
+                pedogenesis::effective_erodibility(
+                    params.k_f_sed, soil_state[node], params.alpha_erodibility)
+            } else {
+                pedogenesis::effective_erodibility(
+                    params.k_f, soil_state[node], params.alpha_erodibility)
+            };
 
             let mut h = h_old;
             let mut converged = false;
-            let max_iter = 50; // Increased from 20 for robustness
-            let tol = 1e-12;
 
-            for iter in 0..max_iter {
+            for iter in 0..50 {
                 let slope = ((h - h_recv) / dx).max(0.0);
                 let s_n = slope.powf(params.n);
                 let f = h - h_old + dt * k_eff * q_m * s_n;
@@ -189,19 +190,17 @@ pub fn implicit_spl_erode(
                 let dh = f / df;
                 h -= dh;
 
-                if dh.abs() < tol {
+                if dh.abs() < 1e-12 {
                     converged = true;
                     break;
                 }
 
-                // Damped step if oscillating (critique fix #5)
                 if iter > 10 && dh.abs() > 0.5 * (h_old - h_recv) {
                     h = 0.5 * (h + h_old);
                 }
             }
 
             if !converged {
-                // Fallback: use linear approximation
                 let factor = k_eff * q_m / dx;
                 h = (h_old + dt * factor * h_recv) / (1.0 + dt * factor);
             }
@@ -224,20 +223,18 @@ pub fn implicit_spl_erode(
         }
     }
 
-    // Deposit transported nutrients at receiver locations
+    // Write back
     for i in 0..n_nodes {
         let (r, c) = grid.grid_index(i);
         grid.elevation[[r, c]] = elev[i];
         grid.bedrock[[r, c]] = bedrock[i];
         grid.sediment[[r, c]] = sediment[i];
 
-        // Add deposited nutrients to local pools
-        let deposited_c = c_flux[i] / cell_area; // kg/m²
+        let deposited_c = c_flux[i] / cell_area;
         let deposited_n = n_flux[i] / cell_area;
         grid.soil_carbon[[r, c]] += deposited_c;
         grid.soil_nitrogen[[r, c]] += deposited_n;
 
-        // Remove mobilized nutrients from eroded cells
         if grid.erosion_rate[[r, c]] > 0.0 {
             let eroded_frac = (grid.erosion_rate[[r, c]] * dt / sediment[i].max(0.01)).min(1.0);
             grid.soil_carbon[[r, c]] *= (1.0 - eroded_frac).max(0.0);
@@ -246,7 +243,7 @@ pub fn implicit_spl_erode(
     }
 }
 
-/// ξ-q under-capacity erosion-deposition solver with dual-layer tracking.
+/// ξ-q under-capacity erosion-deposition solver with soil-state coupling.
 pub fn implicit_xi_q_erode(
     grid: &mut TerrainGrid,
     routing: &FlowRoutingResult,
@@ -261,6 +258,7 @@ pub fn implicit_xi_q_erode(
     let mut bedrock: Vec<f64> = grid.bedrock.iter().copied().collect();
     let mut sediment: Vec<f64> = grid.sediment.iter().copied().collect();
     let discharge: Vec<f64> = grid.discharge.iter().copied().collect();
+    let soil_state: Vec<f64> = grid.soil_state.iter().copied().collect();
     let mut sed_flux = vec![0.0f64; n_nodes];
 
     for i in 0..n_nodes {
@@ -277,11 +275,17 @@ pub fn implicit_xi_q_erode(
 
         let q_w = discharge[node];
         let q_m = q_w.powf(params.m);
-        let xi = (q_w * params.d_star) / params.v_s;
-        let xi = xi.max(1e-10);
+        let xi = ((q_w * params.d_star) / params.v_s).max(1e-10);
         let incoming_sed = sed_flux[node];
 
-        let k_eff = if sediment[node] > 0.01 { params.k_f_sed } else { params.k_f };
+        // Solution #2: on-the-fly K_f
+        let k_eff = if sediment[node] > 0.01 {
+            pedogenesis::effective_erodibility(
+                params.k_f_sed, soil_state[node], params.alpha_erodibility)
+        } else {
+            pedogenesis::effective_erodibility(
+                params.k_f, soil_state[node], params.alpha_erodibility)
+        };
 
         if (params.n - 1.0).abs() < 1e-10 {
             let h_recv = elev[recv];
@@ -301,7 +305,6 @@ pub fn implicit_xi_q_erode(
                 sediment[node] -= sed_eroded;
                 bedrock[node] -= (dh - sed_eroded).max(0.0);
             } else {
-                // Deposition: add to sediment layer
                 sediment[node] += (-dh).max(0.0);
             }
 
@@ -319,7 +322,6 @@ pub fn implicit_xi_q_erode(
             let (r, c) = grid.grid_index(node);
             grid.erosion_rate[[r, c]] = dh / dt;
         } else {
-            // Nonlinear with adaptive Newton-Raphson
             let h_recv = elev[recv];
             let mut h = elev[node];
             let mut converged = false;
@@ -388,31 +390,32 @@ pub fn implicit_xi_q_erode(
 /// Hillslope diffusion parameters.
 #[derive(Clone, Debug)]
 pub struct DiffusionParams {
-    /// Linear diffusivity K_d [m²/yr]
+    /// Base linear diffusivity K_d [m²/yr]
     pub k_d: f64,
     /// Critical slope S_c for nonlinear diffusion [m/m] (Roering et al., 1999)
-    /// Set to f64::INFINITY to use linear diffusion only.
     pub s_c: f64,
+    /// Soil-state sensitivity for diffusivity: K_d * (1 + beta * S) (Solution #1)
+    pub beta_diffusivity: f64,
 }
 
 impl Default for DiffusionParams {
     fn default() -> Self {
         Self {
             k_d: 0.01,
-            s_c: f64::INFINITY, // Linear by default
+            s_c: f64::INFINITY,
+            beta_diffusivity: 0.3,
         }
     }
 }
 
-/// Hillslope diffusion with nonlinear Roering option and implicit ADI solver.
+/// Hillslope diffusion with operator-split variable K_d (Solution #1).
 ///
-/// **Critique fix #1b**: When `s_c` is finite, uses the Roering et al. (1999)
-/// nonlinear diffusion: q_s = K_d * S / (1 - (S/S_c)²). This correctly models
-/// the rapid increase in sediment flux as slopes approach the angle of repose.
+/// Two-phase approach:
+/// 1. Implicit ADI with constant K_d_base → unconditionally stable
+/// 2. Explicit correction for ΔK_d(S) = K_d_base * β * S → soil-modulated creep
 ///
-/// **Critique fix #1c**: Uses Alternating Direction Implicit (ADI) splitting for
-/// the linear case, eliminating the CFL-induced sub-stepping bottleneck. The
-/// ADI method is unconditionally stable regardless of dt/dx² ratio.
+/// The explicit correction is stable as long as β*S is moderate relative to the
+/// base (physically reasonable: soil development modulates but doesn't dominate).
 pub fn hillslope_diffusion(
     grid: &mut TerrainGrid,
     params: &DiffusionParams,
@@ -421,17 +424,17 @@ pub fn hillslope_diffusion(
     if params.s_c.is_finite() {
         nonlinear_hillslope_diffusion(grid, params, dt);
     } else {
+        // Phase 1: Implicit ADI with constant K_d_base
         implicit_adi_diffusion(grid, params.k_d, dt);
+
+        // Phase 2: Explicit correction for soil-induced variance (Solution #1)
+        if params.beta_diffusivity > 0.0 {
+            explicit_variable_kd_correction(grid, params, dt);
+        }
     }
 }
 
-/// Implicit ADI (Alternating Direction Implicit) linear diffusion.
-///
-/// Solves ∂h/∂t = K_d ∇²h in two half-steps:
-/// 1. Implicit in x, explicit in y (half step)
-/// 2. Implicit in y, explicit in x (half step)
-///
-/// Unconditionally stable — no CFL restriction, no sub-stepping needed.
+/// Implicit ADI linear diffusion with constant K_d (unconditionally stable).
 fn implicit_adi_diffusion(grid: &mut TerrainGrid, k_d: f64, dt: f64) {
     let rows = grid.rows;
     let cols = grid.cols;
@@ -444,27 +447,23 @@ fn implicit_adi_diffusion(grid: &mut TerrainGrid, k_d: f64, dt: f64) {
     // Half-step 1: implicit in x-direction
     let mut intermediate = grid.elevation.clone();
     for r in 1..rows - 1 {
-        // Build tridiagonal system for this row: -rx*h[c-1] + (1+2rx)*h[c] - rx*h[c+1] = rhs
-        let mut a_coef = vec![0.0f64; cols]; // sub-diagonal
-        let mut b_coef = vec![0.0f64; cols]; // diagonal
-        let mut c_coef = vec![0.0f64; cols]; // super-diagonal
-        let mut d_rhs  = vec![0.0f64; cols]; // RHS
+        let mut a_coef = vec![0.0f64; cols];
+        let mut b_coef = vec![0.0f64; cols];
+        let mut c_coef = vec![0.0f64; cols];
+        let mut d_rhs  = vec![0.0f64; cols];
 
         for c in 1..cols - 1 {
             a_coef[c] = -rx;
             b_coef[c] = 1.0 + 2.0 * rx;
             c_coef[c] = -rx;
-            // Explicit in y-direction for the RHS
             d_rhs[c] = grid.elevation[[r, c]]
                 + ry * (grid.elevation[[r + 1, c]] - 2.0 * grid.elevation[[r, c]] + grid.elevation[[r - 1, c]]);
         }
-        // Boundary conditions (Dirichlet: fixed)
         b_coef[0] = 1.0;
         d_rhs[0] = grid.elevation[[r, 0]];
         b_coef[cols - 1] = 1.0;
         d_rhs[cols - 1] = grid.elevation[[r, cols - 1]];
 
-        // Thomas algorithm
         let result = thomas_solve(&a_coef, &b_coef, &c_coef, &d_rhs);
         for c in 0..cols {
             intermediate[[r, c]] = result[c];
@@ -496,29 +495,59 @@ fn implicit_adi_diffusion(grid: &mut TerrainGrid, k_d: f64, dt: f64) {
         }
     }
 
-    // Update bedrock/sediment: diffusion moves sediment (not bedrock)
-    for r in 0..rows {
-        for c in 0..cols {
-            let new_elev = grid.elevation[[r, c]];
-            let old_surface = grid.bedrock[[r, c]] + grid.sediment[[r, c]];
-            let dh = new_elev - old_surface;
-            if dh > 0.0 {
-                grid.sediment[[r, c]] += dh;
-            } else {
-                let sed_removed = (-dh).min(grid.sediment[[r, c]]);
-                grid.sediment[[r, c]] -= sed_removed;
-            }
-            grid.elevation[[r, c]] = grid.bedrock[[r, c]] + grid.sediment[[r, c]];
-        }
-    }
+    update_sediment_from_diffusion(grid);
 }
 
-/// Nonlinear Roering et al. (1999) hillslope diffusion.
+/// Explicit correction for spatially variable K_d modulated by soil state (Solution #1).
 ///
-/// Sediment flux: q_s = K_d * S / (1 - (S/S_c)²)
+/// ΔK_d(r,c) = K_d_base * β * S(r,c)
+/// Δh(r,c) = dt * ΔK_d(r,c) * ∇²h(r,c)
 ///
-/// As S → S_c, flux → ∞, producing steep threshold hillslopes matching
-/// observed angle-of-repose behavior. Solved explicitly with adaptive sub-stepping.
+/// This is applied AFTER the stable implicit ADI pass. The correction is small
+/// relative to the base diffusion (β*S << 1 in most cells), so explicit treatment
+/// is numerically safe. For extreme cases, adaptive sub-stepping is used.
+fn explicit_variable_kd_correction(
+    grid: &mut TerrainGrid,
+    params: &DiffusionParams,
+    dt: f64,
+) {
+    let rows = grid.rows;
+    let cols = grid.cols;
+    let dx2 = grid.dx * grid.dx;
+    let dy2 = grid.dy * grid.dy;
+
+    // Estimate max effective ΔK_d for CFL check
+    let max_s = grid.soil_state.iter().cloned().fold(0.0f64, f64::max);
+    let max_delta_kd = params.k_d * params.beta_diffusivity * max_s;
+    let cfl_dt = 0.25 * dx2.min(dy2) / max_delta_kd.max(1e-30);
+    let n_sub = ((dt / cfl_dt).ceil() as usize).max(1).min(100);
+    let sub_dt = dt / n_sub as f64;
+
+    for _ in 0..n_sub {
+        let elev_snapshot = grid.elevation.clone();
+
+        for r in 1..rows - 1 {
+            for c in 1..cols - 1 {
+                let s = grid.soil_state[[r, c]];
+                let delta_kd = params.k_d * params.beta_diffusivity * s;
+
+                if delta_kd < 1e-30 { continue; }
+
+                let laplacian =
+                    (elev_snapshot[[r + 1, c]] + elev_snapshot[[r - 1, c]]
+                        - 2.0 * elev_snapshot[[r, c]]) / dy2
+                    + (elev_snapshot[[r, c + 1]] + elev_snapshot[[r, c - 1]]
+                        - 2.0 * elev_snapshot[[r, c]]) / dx2;
+
+                grid.elevation[[r, c]] += sub_dt * delta_kd * laplacian;
+            }
+        }
+    }
+
+    update_sediment_from_diffusion(grid);
+}
+
+/// Nonlinear Roering et al. (1999) hillslope diffusion (explicit, sub-stepped).
 fn nonlinear_hillslope_diffusion(grid: &mut TerrainGrid, params: &DiffusionParams, dt: f64) {
     let rows = grid.rows;
     let cols = grid.cols;
@@ -528,7 +557,6 @@ fn nonlinear_hillslope_diffusion(grid: &mut TerrainGrid, params: &DiffusionParam
     let s_c = params.s_c;
     let s_c2 = s_c * s_c;
 
-    // Estimate max effective diffusivity for CFL
     let max_slope = grid.slope.iter().cloned().fold(0.0f64, f64::max);
     let ratio = (max_slope / s_c).min(0.99);
     let k_eff_max = k_d / (1.0 - ratio * ratio).powi(2);
@@ -540,22 +568,43 @@ fn nonlinear_hillslope_diffusion(grid: &mut TerrainGrid, params: &DiffusionParam
         let elev_old = grid.elevation.clone();
         for r in 1..rows - 1 {
             for c in 1..cols - 1 {
-                // Compute slopes
                 let sx = (elev_old[[r, c + 1]] - elev_old[[r, c - 1]]) / (2.0 * dx);
                 let sy = (elev_old[[r + 1, c]] - elev_old[[r - 1, c]]) / (2.0 * dy);
                 let s_mag = (sx * sx + sy * sy).sqrt();
 
-                // Nonlinear diffusivity: K_eff = K_d / (1 - (S/Sc)²)
-                let ratio_sq = (s_mag * s_mag / s_c2).min(0.99);
-                let k_eff = k_d / (1.0 - ratio_sq);
+                // Include soil-state modulation in nonlinear diffusivity too
+                let soil_s = grid.soil_state[[r, c]];
+                let base_k = pedogenesis::effective_diffusivity(k_d, soil_s, params.beta_diffusivity);
 
-                // Laplacian with effective diffusivity
+                let ratio_sq = (s_mag * s_mag / s_c2).min(0.99);
+                let k_eff = base_k / (1.0 - ratio_sq);
+
                 let laplacian =
                     (elev_old[[r + 1, c]] + elev_old[[r - 1, c]] - 2.0 * elev_old[[r, c]]) / (dy * dy)
-                  + (elev_old[[r, c + 1]] + elev_old[[r, c - 1]] - 2.0 * elev_old[[r, c]]) / (dx * dx);
+                    + (elev_old[[r, c + 1]] + elev_old[[r, c - 1]] - 2.0 * elev_old[[r, c]]) / (dx * dx);
 
                 grid.elevation[[r, c]] += sub_dt * k_eff * laplacian;
             }
+        }
+    }
+
+    update_sediment_from_diffusion(grid);
+}
+
+/// Update sediment layer after diffusion has modified elevation.
+fn update_sediment_from_diffusion(grid: &mut TerrainGrid) {
+    for r in 0..grid.rows {
+        for c in 0..grid.cols {
+            let new_elev = grid.elevation[[r, c]];
+            let old_surface = grid.bedrock[[r, c]] + grid.sediment[[r, c]];
+            let dh = new_elev - old_surface;
+            if dh > 0.0 {
+                grid.sediment[[r, c]] += dh;
+            } else {
+                let sed_removed = (-dh).min(grid.sediment[[r, c]]);
+                grid.sediment[[r, c]] -= sed_removed;
+            }
+            grid.elevation[[r, c]] = grid.bedrock[[r, c]] + grid.sediment[[r, c]];
         }
     }
 }

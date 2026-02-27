@@ -1,14 +1,11 @@
-//! fastscape-rs: High-performance landscape evolution model with reduced-complexity climate coupling.
+//! fastscape-rs v0.2: Landscape evolution with nonlinear pedogenesis and BDI agents.
 //!
-//! Architecture:
-//! - SoA memory layout (grid module) for SIMD-friendly cache utilization
-//! - CSR flow graph (graph module) eliminating million-allocation Vec<Vec<usize>>
-//! - D-infinity flow routing (flow module) for grid-artifact-free hydrology
-//! - Implicit O(n) SPL + ξ-q erosion-deposition solver (erosion module)
-//! - Linear Theory / LFPM / EBM climate models (climate module)
-//! - MPRK positivity-preserving integrators (integrators module)
-//!
-//! Temporal coupling uses operator splitting: steady-state climate → flow routing → erosion
+//! Integrates 5 solutions:
+//! 1. Spatially variable K_d via operator splitting (erosion module)
+//! 2. On-the-fly K_f from soil state (erosion + pedogenesis modules)
+//! 3. ε-regularized dR/dt with MPRK integration (pedogenesis module)
+//! 4. Influence maps for BDI agent → SoA bridging (agents + grid modules)
+//! 5. Multi-scale sub-stepping with biological sub-cycle (this module)
 
 pub mod grid;
 pub mod graph;
@@ -16,12 +13,15 @@ pub mod flow;
 pub mod erosion;
 pub mod climate;
 pub mod integrators;
+pub mod pedogenesis;
+pub mod agents;
 
 use grid::TerrainGrid;
 use erosion::{StreamPowerParams, XiQParams, DiffusionParams};
 use climate::{LinearTheoryParams, LfpmParams, EbmParams};
+use pedogenesis::PedogenesisParams;
+use agents::{AgentParams, AgentPopulation};
 
-/// Which climate model to use for precipitation.
 #[derive(Clone, Debug)]
 pub enum ClimateModel {
     Uniform { rate: f64 },
@@ -29,14 +29,12 @@ pub enum ClimateModel {
     Lfpm(LfpmParams),
 }
 
-/// Which erosion model to use.
 #[derive(Clone, Debug)]
 pub enum ErosionModel {
     StreamPower(StreamPowerParams),
     XiQ(XiQParams),
 }
 
-/// Full simulation configuration.
 #[derive(Clone, Debug)]
 pub struct SimulationConfig {
     pub rows: usize,
@@ -49,7 +47,11 @@ pub struct SimulationConfig {
     pub erosion: ErosionModel,
     pub ebm: EbmParams,
     pub diffusion: DiffusionParams,
+    pub pedogenesis: PedogenesisParams,
+    pub agents: AgentParams,
     pub enable_biogeochem: bool,
+    pub enable_pedogenesis: bool,
+    pub enable_agents: bool,
     pub init_elevation: f64,
     pub init_perturbation: f64,
     pub seed: u64,
@@ -68,7 +70,11 @@ impl Default for SimulationConfig {
             erosion: ErosionModel::StreamPower(StreamPowerParams::default()),
             ebm: EbmParams::default(),
             diffusion: DiffusionParams::default(),
+            pedogenesis: PedogenesisParams::default(),
+            agents: AgentParams::default(),
             enable_biogeochem: false,
+            enable_pedogenesis: false,
+            enable_agents: false,
             init_elevation: 0.0,
             init_perturbation: 1.0,
             seed: 42,
@@ -76,7 +82,6 @@ impl Default for SimulationConfig {
     }
 }
 
-/// Diagnostic statistics collected at each output step.
 #[derive(Clone, Debug)]
 pub struct StepDiagnostics {
     pub time: f64,
@@ -85,18 +90,18 @@ pub struct StepDiagnostics {
     pub mean_precipitation: f64,
     pub mean_erosion_rate: f64,
     pub total_sediment_flux: f64,
+    pub mean_soil_state: f64,
+    pub max_soil_state: f64,
+    pub agent_count: usize,
 }
 
-/// Run the full coupled landscape-climate simulation.
+/// Run the full coupled simulation.
 ///
-/// Operator splitting loop per timestep:
-/// 1. Compute steady-state climate fields from current topography
-/// 2. Compute temperature and PET via iterative EBM
-/// 3. Priority-Flood depression filling
-/// 4. Route flow (D∞) on filled surface and accumulate discharge
-/// 5. Apply erosion with dual-layer substrate tracking
-/// 6. Apply hillslope diffusion (ADI or nonlinear Roering)
-/// 7. Optionally integrate soil biogeochemistry (MPRK22)
+/// Per macro timestep:
+///   1. Biological sub-cycle: agents run representative_steps, accumulate influence (Sol #4+#5)
+///   2. Climate → Fill → Route → Erode(K_f(S), Sol #2) → Diffuse(K_d(S), Sol #1)
+///   3. Pedogenesis dS/dt with ε-regularization (Sol #3) via MPRK22
+///   4. Biogeochemistry via MPRK22
 pub fn run_simulation(config: &SimulationConfig) -> (TerrainGrid, Vec<StepDiagnostics>) {
     let mut grid = TerrainGrid::new(config.rows, config.cols, config.dx, config.dy);
     grid.init_random_perturbation(config.init_elevation, config.init_perturbation, config.seed);
@@ -106,20 +111,55 @@ pub fn run_simulation(config: &SimulationConfig) -> (TerrainGrid, Vec<StepDiagno
         for val in grid.soil_nitrogen.iter_mut() { *val = 0.5; }
     }
 
+    if config.enable_pedogenesis {
+        let mut rng_state = config.seed.wrapping_add(999);
+        for val in grid.soil_state.iter_mut() {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((rng_state >> 33) as f64) / (u32::MAX as f64);
+            *val = 0.1 + 0.05 * (r - 0.5);
+        }
+    }
+
+    let mut population = if config.enable_agents {
+        Some(AgentPopulation::new(
+            &config.agents, config.rows, config.cols,
+            config.seed.wrapping_add(7777),
+        ))
+    } else {
+        None
+    };
+
     let n_steps = (config.total_time / config.dt_geomorph).ceil() as usize;
     let output_interval = (n_steps / 50).max(1);
     let mut diagnostics = Vec::new();
     let mut time = 0.0;
 
-    println!("=== fastscape-rs Simulation ===");
-    println!("Grid: {}×{} cells, dx={:.0}m", config.rows, config.cols, config.dx);
-    println!("Time: {:.0} yr total, dt={:.0} yr ({} steps)", config.total_time, config.dt_geomorph, n_steps);
-    println!("Diffusion: K_d={:.4}, S_c={}", config.diffusion.k_d,
-        if config.diffusion.s_c.is_finite() { format!("{:.2}", config.diffusion.s_c) } else { "∞ (linear)".into() });
+    println!("=== fastscape-rs v0.2: Pedogenesis + BDI Agents ===");
+    println!("Grid: {}x{} cells, dx={:.0}m", config.rows, config.cols, config.dx);
+    println!("Time: {:.0} yr total, dt_geomorph={:.0} yr ({} steps)",
+        config.total_time, config.dt_geomorph, n_steps);
+    if config.enable_pedogenesis {
+        println!("Pedogenesis: ENABLED (Phillips, eps={:.3})", config.pedogenesis.epsilon);
+    }
+    if config.enable_agents {
+        println!("BDI Agents: ENABLED ({} initial, dt_bio={:.0}yr, {} repr. steps)",
+            config.agents.initial_count, config.agents.dt_bio, config.agents.representative_steps);
+    }
+    println!("Diffusion: K_d={:.4}, beta={:.2}, S_c={}",
+        config.diffusion.k_d, config.diffusion.beta_diffusivity,
+        if config.diffusion.s_c.is_finite() { format!("{:.2}", config.diffusion.s_c) }
+        else { "inf (linear)".into() });
     println!();
 
     for step in 0..n_steps {
-        // === 1. Climate ===
+        // === Phase A: Biological Sub-Cycle (Solutions #4 + #5) ===
+        if let Some(ref mut pop) = population {
+            agents::run_biological_subcycle(
+                &mut grid, pop, &config.agents, config.dt_geomorph,
+            );
+        }
+
+        // === Phase B: Geomorphological Step ===
         match &config.climate {
             ClimateModel::Uniform { rate } => { grid.precipitation.fill(*rate); }
             ClimateModel::LinearTheory(params) => {
@@ -130,18 +170,13 @@ pub fn run_simulation(config: &SimulationConfig) -> (TerrainGrid, Vec<StepDiagno
             }
         }
 
-        // === 2. Temperature and PET via iterative EBM ===
         climate::compute_temperature_pet(&mut grid, &config.ebm);
-
-        // === 3. Priority-Flood depression filling ===
         flow::priority_flood_fill(&mut grid);
 
-        // === 4. Flow routing (D∞ on filled surface) ===
         let routing = flow::route_flow_dinf(&grid);
         flow::accumulate_flow(&mut grid, &routing);
         flow::compute_slopes(&mut grid);
 
-        // === 5. Erosion with dual-layer substrate ===
         match &config.erosion {
             ErosionModel::StreamPower(params) => {
                 erosion::implicit_spl_erode(&mut grid, &routing, params, config.dt_geomorph);
@@ -151,10 +186,12 @@ pub fn run_simulation(config: &SimulationConfig) -> (TerrainGrid, Vec<StepDiagno
             }
         }
 
-        // === 6. Hillslope diffusion (implicit ADI or nonlinear Roering) ===
         erosion::hillslope_diffusion(&mut grid, &config.diffusion, config.dt_geomorph);
 
-        // === 7. Soil biogeochemistry (MPRK22) ===
+        if config.enable_pedogenesis {
+            pedogenesis::integrate_pedogenesis(&mut grid, &config.pedogenesis, config.dt_geomorph);
+        }
+
         if config.enable_biogeochem {
             integrators::integrate_soil_biogeochemistry(&mut grid, config.dt_geomorph);
         }
@@ -162,11 +199,13 @@ pub fn run_simulation(config: &SimulationConfig) -> (TerrainGrid, Vec<StepDiagno
         time += config.dt_geomorph;
 
         if step % output_interval == 0 || step == n_steps - 1 {
-            let diag = collect_diagnostics(&grid, time);
+            let agent_count = population.as_ref().map_or(0, |p| p.agents.len());
+            let diag = collect_diagnostics(&grid, time, agent_count);
             println!(
-                "  Step {:5}/{}: t={:.2} Myr | h_mean={:.1}m | h_max={:.1}m | P_mean={:.3} m/yr",
+                "  Step {:5}/{}: t={:.2}Myr | h_mean={:.1}m | h_max={:.1}m | S_mean={:.3} | agents={}",
                 step + 1, n_steps, time / 1e6,
-                diag.mean_elevation, diag.max_elevation, diag.mean_precipitation,
+                diag.mean_elevation, diag.max_elevation,
+                diag.mean_soil_state, diag.agent_count,
             );
             diagnostics.push(diag);
         }
@@ -176,20 +215,17 @@ pub fn run_simulation(config: &SimulationConfig) -> (TerrainGrid, Vec<StepDiagno
     (grid, diagnostics)
 }
 
-fn collect_diagnostics(grid: &TerrainGrid, time: f64) -> StepDiagnostics {
+fn collect_diagnostics(grid: &TerrainGrid, time: f64, agent_count: usize) -> StepDiagnostics {
     let n = grid.len() as f64;
-    let mean_elevation = grid.elevation.iter().sum::<f64>() / n;
-    let max_elevation = grid.elevation.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mean_precipitation = grid.precipitation.iter().sum::<f64>() / n;
-    let mean_erosion_rate = grid.erosion_rate.iter().map(|e| e.abs()).sum::<f64>() / n;
-    let total_sediment_flux = grid.sediment_flux.iter().sum::<f64>();
-
     StepDiagnostics {
         time,
-        mean_elevation,
-        max_elevation,
-        mean_precipitation,
-        mean_erosion_rate,
-        total_sediment_flux,
+        mean_elevation: grid.elevation.iter().sum::<f64>() / n,
+        max_elevation: grid.elevation.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        mean_precipitation: grid.precipitation.iter().sum::<f64>() / n,
+        mean_erosion_rate: grid.erosion_rate.iter().map(|e| e.abs()).sum::<f64>() / n,
+        total_sediment_flux: grid.sediment_flux.iter().sum::<f64>(),
+        mean_soil_state: grid.soil_state.iter().sum::<f64>() / n,
+        max_soil_state: grid.soil_state.iter().cloned().fold(0.0f64, f64::max),
+        agent_count,
     }
 }

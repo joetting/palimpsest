@@ -1,12 +1,4 @@
 //! Reduced-complexity climate models with corrected boundary treatments.
-//!
-//! **Critique fixes**:
-//! - #3a: LT FFT now applies a Hann window and zero-pads the domain to suppress
-//!   spectral ringing from the implicit periodic boundary assumption.
-//! - #3b: LFPM now performs actual coordinate rotation using the advection_direction
-//!   parameter, no longer hardcoded to West-East.
-//! - #3c: EBM now iterates to find a single equilibrium temperature satisfying the
-//!   energy balance, rather than an unphysical weighted blend.
 
 use ndarray::Array2;
 use crate::grid::TerrainGrid;
@@ -47,11 +39,6 @@ impl Default for LinearTheoryParams {
 }
 
 /// Compute orographic precipitation with Hann windowing and zero-padding.
-///
-/// **Critique fix #3a**: The raw elevation field is multiplied by a 2D Hann window
-/// before FFT to smoothly taper the edges to zero. The domain is then zero-padded
-/// to the next power of 2 in each dimension. This eliminates the high-frequency
-/// spectral artifacts (Gibbs ringing) caused by the implicit periodicity assumption.
 pub fn linear_theory_precipitation(
     grid: &mut TerrainGrid,
     params: &LinearTheoryParams,
@@ -61,14 +48,10 @@ pub fn linear_theory_precipitation(
     let dx = grid.dx;
     let dy = grid.dy;
 
-    // Wind components
     let u_wind = params.wind_speed * params.wind_direction.cos();
     let v_wind = params.wind_speed * params.wind_direction.sin();
-
-    // Moisture scale factor C_w = rho_sref * Gamma_m / rho_water
     let c_w = params.rho_sref * params.lapse_rate;
 
-    // Zero-pad to next power of 2 for FFT efficiency and to reduce wrap-around
     let pad_rows = rows.next_power_of_two();
     let pad_cols = cols.next_power_of_two();
 
@@ -78,7 +61,6 @@ pub fn linear_theory_precipitation(
     let ifft_cols = planner.plan_fft_inverse(pad_cols);
     let ifft_rows = planner.plan_fft_inverse(pad_rows);
 
-    // Apply Hann window to elevation and place in zero-padded field
     let mut field = vec![Complex::new(0.0, 0.0); pad_rows * pad_cols];
     for r in 0..rows {
         let wr = 0.5 * (1.0 - (2.0 * PI * r as f64 / rows as f64).cos());
@@ -89,7 +71,6 @@ pub fn linear_theory_precipitation(
         }
     }
 
-    // Forward FFT: rows then columns
     let mut scratch = vec![Complex::new(0.0, 0.0); pad_rows.max(pad_cols)];
     for r in 0..pad_rows {
         let start = r * pad_cols;
@@ -107,7 +88,6 @@ pub fn linear_theory_precipitation(
         }
     }
 
-    // Apply transfer function
     let norm = 1.0 / (pad_rows * pad_cols) as f64;
     for kr in 0..pad_rows {
         for kc in 0..pad_cols {
@@ -135,10 +115,7 @@ pub fn linear_theory_precipitation(
                 0.0
             };
 
-            // Transfer function numerator: C_w * i * σ * (vertical structure)
             let numerator = Complex::new(0.0, c_w * sigma * params.hw);
-
-            // Denominator: (1 - i*m*H_w) * (1 + i*σ*τ_c) * (1 + i*σ*τ_f)
             let m_vert = if m_sq > 0.0 { m_sq.sqrt() } else { 0.0 };
             let d1 = Complex::new(1.0, -m_vert * params.hw);
             let d2 = Complex::new(1.0, sigma * params.tau_c);
@@ -154,7 +131,6 @@ pub fn linear_theory_precipitation(
         }
     }
 
-    // Inverse FFT
     for c in 0..pad_cols {
         for r in 0..pad_rows {
             col_buf[r] = field[r * pad_cols + c];
@@ -165,14 +141,12 @@ pub fn linear_theory_precipitation(
         }
     }
 
-    // Inverse FFT: rows
     for r in 0..rows {
         let start = r * cols;
         let row_slice = &mut field[start..start + cols];
         ifft_cols.process_with_scratch(row_slice, &mut scratch[..cols]);
     }
 
-    // Extract the original domain and undo the Hann window effect via normalization
     for r in 0..rows {
         for c in 0..cols {
             let orog = field[r * pad_cols + c].re * norm;
@@ -187,19 +161,12 @@ pub fn linear_theory_precipitation(
 
 #[derive(Clone, Debug)]
 pub struct LfpmParams {
-    /// Background vapor flux F_v0 [m²/yr]
     pub fv0: f64,
-    /// Condensation length scale L_c [m]
     pub l_c: f64,
-    /// Fallout length scale L_f [m]
     pub l_f: f64,
-    /// Transversal dispersion length scale L_d [m]
     pub l_d: f64,
-    /// Sea-level re-evaporation coefficient β₀
     pub beta_0: f64,
-    /// Thermodynamic scale height H₀ [m]
     pub h0: f64,
-    /// Advection direction (radians, 0 = along x-axis)
     pub advection_direction: f64,
 }
 
@@ -207,9 +174,9 @@ impl Default for LfpmParams {
     fn default() -> Self {
         Self {
             fv0: 500.0,
-            l_c: 50_000.0,  // 50 km
-            l_f: 5_000.0,   // 5 km
-            l_d: 10_000.0,  // 10 km
+            l_c: 50_000.0,
+            l_f: 5_000.0,
+            l_d: 10_000.0,
             beta_0: 0.8,
             h0: 2500.0,
             advection_direction: 0.0,
@@ -218,11 +185,6 @@ impl Default for LfpmParams {
 }
 
 /// Compute precipitation using LFPM 1.0 with proper coordinate rotation.
-///
-/// **Critique fix #3b**: The advection_direction parameter is now implemented via
-/// coordinate rotation. The elevation field is rotated so that the advection axis
-/// aligns with the x-axis, the upwind solver runs, and the precipitation field is
-/// rotated back. This correctly handles arbitrary wind directions.
 pub fn lfpm_precipitation(
     grid: &mut TerrainGrid,
     params: &LfpmParams,
@@ -235,22 +197,12 @@ pub fn lfpm_precipitation(
     let cos_a = params.advection_direction.cos();
     let sin_a = params.advection_direction.sin();
 
-    // For directions near cardinal axes, use direct sweep without rotation
-    // For arbitrary angles, use bilinear interpolation on rotated coordinates
-    //
-    // We implement the general case: sweep along advection direction using
-    // the projected coordinates. For each "advection column" (perpendicular
-    // to wind), we solve the upwind + transversal dispersion system.
-
     let mut fv = Array2::from_elem((rows, cols), params.fv0);
     let mut fc: Array2<f64> = Array2::zeros((rows, cols));
 
-    // Determine sweep order based on advection direction
-    // Primary advection component along x (cos_a) or y (sin_a)
     let sweep_x = cos_a.abs() >= sin_a.abs();
 
     if sweep_x {
-        // Primary sweep along columns (x-axis)
         let sign = if cos_a >= 0.0 { 1i32 } else { -1i32 };
         let col_order: Vec<usize> = if sign > 0 {
             (1..cols).collect()
@@ -273,7 +225,6 @@ pub fn lfpm_precipitation(
                 let exchange = (fv_prev - beta * fc_prev) / params.l_c;
                 let fallout = fc_prev / params.l_f;
 
-                // Add cross-wind component contribution
                 let cross_contrib = if sin_a.abs() > 0.01 && r > 0 && r < rows - 1 {
                     let fv_cross = if sin_a > 0.0 { fv[[r - 1, c]] } else { fv[[r + 1, c]] };
                     sin_a.abs() * (fv_cross - fv_prev) / dy * 0.1
@@ -291,7 +242,6 @@ pub fn lfpm_precipitation(
             }
         }
     } else {
-        // Primary sweep along rows (y-axis)
         let sign = if sin_a >= 0.0 { 1i32 } else { -1i32 };
         let row_order: Vec<usize> = if sign > 0 {
             (1..rows).collect()
@@ -332,7 +282,6 @@ pub fn lfpm_precipitation(
     }
 }
 
-/// Thomas algorithm for transversal dispersion along a column (y-direction).
 fn solve_tridiagonal_dispersion_inplace(
     field: &mut Array2<f64>, col: usize, rows: usize, d: f64,
 ) {
@@ -361,7 +310,6 @@ fn solve_tridiagonal_dispersion_inplace(
     }
 }
 
-/// Thomas algorithm for transversal dispersion along a row (x-direction).
 fn solve_tridiagonal_dispersion_row_inplace(
     field: &mut Array2<f64>, row: usize, cols: usize, d: f64,
 ) {
@@ -402,11 +350,9 @@ pub struct EbmParams {
     pub albedo_base: f64,
     pub albedo_snow: f64,
     pub snow_threshold: f64,
-    /// Stefan-Boltzmann linearization: I_out = A + B*T
     pub sb_a: f64,
     pub sb_b: f64,
     pub pet_coeff: f64,
-    /// Number of EBM iteration steps (default 5)
     pub max_iterations: usize,
 }
 
@@ -428,14 +374,6 @@ impl Default for EbmParams {
 }
 
 /// Compute surface temperature via iterative EBM equilibrium and PET.
-///
-/// **Critique fix #3c**: Instead of an arbitrary weighted blend, iterates the
-/// energy balance equation to convergence:
-///   Q(1 - α(T)) = A + B*T
-///
-/// where α(T) is the temperature-dependent albedo (switching at snow threshold).
-/// The lapse rate provides the initial guess, and Newton iteration refines it to
-/// a physically consistent equilibrium respecting energy conservation.
 pub fn compute_temperature_pet(
     grid: &mut TerrainGrid,
     params: &EbmParams,
@@ -446,27 +384,16 @@ pub fn compute_temperature_pet(
     for r in 0..rows {
         for c in 0..cols {
             let h = grid.elevation[[r, c]].max(0.0);
-
-            // Initial guess from lapse rate
             let mut t = params.t_sea_level - params.lapse_rate * h;
-
-            // Newton iteration on the energy balance:
-            // F(T) = Q*(1 - α(T)) - A - B*T = 0
-            // dF/dT = Q * (-dα/dT) - B
-            //
-            // Albedo is a smooth step function around snow_threshold:
-            //   α(T) = α_snow + (α_base - α_snow) * sigmoid((T - T_snow) / width)
-            let width = 2.0; // Smoothing width [°C]
+            let width = 2.0;
 
             for _ in 0..params.max_iterations {
                 let sigmoid = 1.0 / (1.0 + (-(t - params.snow_threshold) / width).exp());
                 let albedo = params.albedo_snow
                     + (params.albedo_base - params.albedo_snow) * sigmoid;
 
-                // Energy balance residual
                 let f = params.solar_radiation * (1.0 - albedo) - params.sb_a - params.sb_b * (t + params.lapse_rate * h);
 
-                // Derivative of albedo w.r.t. T
                 let dsigmoid = sigmoid * (1.0 - sigmoid) / width;
                 let dalbedo = (params.albedo_base - params.albedo_snow) * dsigmoid;
 
@@ -476,12 +403,11 @@ pub fn compute_temperature_pet(
                 let dt_step = -f / df;
                 t += dt_step;
 
-                if dt_step.abs() < 0.01 { break; } // Converged to 0.01°C
+                if dt_step.abs() < 0.01 { break; }
             }
 
             grid.temperature[[r, c]] = t;
 
-            // PET (Hargreaves-type)
             let pet = if t > 0.0 { params.pet_coeff * t } else { 0.0 };
             grid.evapotranspiration[[r, c]] = pet;
         }

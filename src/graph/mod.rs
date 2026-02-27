@@ -43,11 +43,9 @@ impl CsrFlowGraph {
 
     /// Build CSR directly from a flat receiver array (each node has exactly 1 receiver).
     /// This builds the *donor* graph: for each receiver r, collect all nodes that flow to r.
-    /// Used for the primary D8/D∞ receiver → donor inversion.
     pub fn from_receivers(receivers: &[usize]) -> Self {
         let num_nodes = receivers.len();
 
-        // Count donors per node
         let mut counts = vec![0usize; num_nodes];
         for &recv in receivers.iter() {
             if recv < num_nodes {
@@ -55,7 +53,6 @@ impl CsrFlowGraph {
             }
         }
 
-        // Build offsets via prefix sum
         let mut offsets = Vec::with_capacity(num_nodes + 1);
         offsets.push(0);
         for &c in counts.iter() {
@@ -63,9 +60,8 @@ impl CsrFlowGraph {
         }
         let total_edges = *offsets.last().unwrap();
 
-        // Fill neighbors
         let mut neighbors = vec![0usize; total_edges];
-        let mut write_pos = offsets.clone(); // current write position per node
+        let mut write_pos = offsets.clone();
         for (donor, &recv) in receivers.iter().enumerate() {
             if recv < num_nodes && recv != donor {
                 let pos = write_pos[recv];

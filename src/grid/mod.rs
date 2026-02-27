@@ -2,6 +2,10 @@
 //!
 //! Each physics pass (climate, hydrology, geomorphology) accesses only the arrays it needs,
 //! achieving near-100% cache line utilization vs the ~8% of an AoS layout.
+//!
+//! **Integration additions**:
+//! - Pedogenesis state S, progressive/regressive rate buffers
+//! - Biological influence map (double-buffered) for agent → grid bridging (Solution #4)
 
 use ndarray::Array2;
 
@@ -53,6 +57,23 @@ pub struct TerrainGrid {
     pub sediment_flux: Array2<f64>,
     /// Local erosion rate [m/yr] (positive = erosion, negative = deposition)
     pub erosion_rate: Array2<f64>,
+
+    // === Pedogenesis state (Phillips nonlinear dynamics) ===
+    /// Degree of soil development S — accumulated pedogenic state [dimensionless, 0..∞)
+    /// Result of integrating dS/dt = dP/dt - dR/dt over time.
+    pub soil_state: Array2<f64>,
+
+    // === Biological Influence Map (Solution #4) ===
+    // Double-buffered: agents write to `_write`, physics reads from `_read`.
+    // Buffers are swapped at the start of each macro timestep.
+    /// Progressive biological influence dP_bio [1/yr] — READ buffer (consumed by physics)
+    pub bio_progressive_read: Array2<f64>,
+    /// Regressive biological influence dR_bio [1/yr] — READ buffer (consumed by physics)
+    pub bio_regressive_read: Array2<f64>,
+    /// Progressive biological influence dP_bio [1/yr] — WRITE buffer (accumulated by agents)
+    pub bio_progressive_write: Array2<f64>,
+    /// Regressive biological influence dR_bio [1/yr] — WRITE buffer (accumulated by agents)
+    pub bio_regressive_write: Array2<f64>,
 }
 
 impl TerrainGrid {
@@ -78,6 +99,11 @@ impl TerrainGrid {
             nitrogen_flux: Array2::zeros((rows, cols)),
             sediment_flux: Array2::zeros((rows, cols)),
             erosion_rate: Array2::zeros((rows, cols)),
+            soil_state: Array2::zeros((rows, cols)),
+            bio_progressive_read: Array2::zeros((rows, cols)),
+            bio_regressive_read: Array2::zeros((rows, cols)),
+            bio_progressive_write: Array2::zeros((rows, cols)),
+            bio_regressive_write: Array2::zeros((rows, cols)),
         }
     }
 
@@ -91,6 +117,19 @@ impl TerrainGrid {
         }
         self.bedrock.assign(&self.elevation);
         self.lake_level.assign(&self.elevation);
+    }
+
+    /// Swap the double-buffered influence maps.
+    ///
+    /// Called at the start of each macro timestep:
+    /// - Move accumulated agent writes → read buffer (for physics to consume)
+    /// - Zero out the write buffer (agents start fresh)
+    pub fn swap_influence_buffers(&mut self) {
+        std::mem::swap(&mut self.bio_progressive_read, &mut self.bio_progressive_write);
+        std::mem::swap(&mut self.bio_regressive_read, &mut self.bio_regressive_write);
+        // Clear write buffers for the next accumulation cycle
+        self.bio_progressive_write.fill(0.0);
+        self.bio_regressive_write.fill(0.0);
     }
 
     #[inline]
@@ -114,7 +153,6 @@ impl TerrainGrid {
     }
 
     /// Enforce the surface constraint: elevation = bedrock + sediment.
-    /// Call after any operation that modifies bedrock or sediment independently.
     pub fn sync_surface(&mut self) {
         for r in 0..self.rows {
             for c in 0..self.cols {

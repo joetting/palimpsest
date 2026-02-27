@@ -1,23 +1,15 @@
 //! Flow routing with Priority-Flood depression filling and D-infinity partitioning.
-//!
-//! **Critique fix #2**: Added Priority-Flood (Barnes et al., 2014) to fill topographic
-//! depressions before routing. Without this, internal pits trap water and halt upstream
-//! erosion. The algorithm uses a min-heap seeded from boundary cells to flood-fill all
-//! depressions to their spill elevation, then routes flow on the filled surface.
 
 use crate::grid::TerrainGrid;
 use crate::graph::CsrFlowGraph;
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 
-/// 8 neighbor offsets: (drow, dcol) for N, NE, E, SE, S, SW, W, NW
 const D8_OFFSETS: [(i32, i32); 8] = [
     (-1, 0), (-1, 1), (0, 1), (1, 1),
     (1, 0),  (1, -1), (0, -1), (-1, -1),
 ];
 
-/// Min-heap entry for Priority-Flood. BinaryHeap is a max-heap,
-/// so we reverse the ordering to get min-heap behavior.
 #[derive(PartialEq)]
 struct FloodEntry {
     elevation: f64,
@@ -28,7 +20,6 @@ impl Eq for FloodEntry {}
 
 impl PartialOrd for FloodEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Reverse: smaller elevation = higher priority
         other.elevation.partial_cmp(&self.elevation)
     }
 }
@@ -49,20 +40,6 @@ pub struct FlowRoutingResult {
 }
 
 /// Priority-Flood depression filling (Barnes, Lehman & Mulla, 2014).
-///
-/// Fills all topographic depressions (pits) so that every interior cell
-/// has at least one downslope neighbor, enabling complete drainage to boundary.
-/// Stores the filled surface in `grid.lake_level`.
-///
-/// Algorithm:
-/// 1. Seed a min-heap with all boundary cells
-/// 2. Pop the lowest cell; for each unvisited neighbor:
-///    - Set its lake_level = max(neighbor_elevation, current_lake_level)
-///    - Push to the heap
-/// 3. After processing, lake_level >= elevation everywhere, and every
-///    cell has a non-ascending path to the boundary.
-///
-/// Complexity: O(N log N) due to the heap operations.
 pub fn priority_flood_fill(grid: &mut TerrainGrid) {
     let rows = grid.rows;
     let cols = grid.cols;
@@ -72,7 +49,6 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
     let mut filled: Vec<f64> = grid.elevation.iter().copied().collect();
     let mut heap = BinaryHeap::new();
 
-    // Seed heap with boundary cells
     for r in 0..rows {
         for c in 0..cols {
             if grid.is_boundary(r, c) {
@@ -86,7 +62,6 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
         }
     }
 
-    // Process heap
     while let Some(entry) = heap.pop() {
         let (r, c) = grid.grid_index(entry.index);
 
@@ -101,11 +76,7 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
                 continue;
             }
             visited[ni] = true;
-
-            // The filled elevation is the max of the neighbor's true elevation
-            // and the current cell's filled elevation (water level of the depression)
             filled[ni] = filled[ni].max(entry.elevation);
-
             heap.push(FloodEntry {
                 elevation: filled[ni],
                 index: ni,
@@ -113,7 +84,6 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
         }
     }
 
-    // Store filled surface as lake_level
     for (i, &val) in filled.iter().enumerate() {
         let (r, c) = grid.grid_index(i);
         grid.lake_level[[r, c]] = val;
@@ -121,15 +91,11 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
 }
 
 /// Compute D-infinity flow routing on the depression-filled surface.
-///
-/// Routes flow on `lake_level` (not raw `elevation`) so that water in filled
-/// depressions routes to the spill point rather than being trapped.
 pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
     let n = grid.len();
     let rows = grid.rows;
     let cols = grid.cols;
 
-    // Route on the filled surface
     let elev = &grid.lake_level;
 
     let mut receivers = vec![0usize; n];
