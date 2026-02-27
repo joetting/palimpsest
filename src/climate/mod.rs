@@ -464,7 +464,7 @@ pub fn compute_temperature_pet(
                     + (params.albedo_base - params.albedo_snow) * sigmoid;
 
                 // Energy balance residual
-                let f = params.solar_radiation * (1.0 - albedo) - params.sb_a - params.sb_b * t;
+                let f = params.solar_radiation * (1.0 - albedo) - params.sb_a - params.sb_b * (t + params.lapse_rate * h);
 
                 // Derivative of albedo w.r.t. T
                 let dsigmoid = sigmoid * (1.0 - sigmoid) / width;
