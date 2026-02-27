@@ -3,6 +3,8 @@ use fastscape_rs::erosion::{StreamPowerParams, DiffusionParams};
 use fastscape_rs::climate::{LinearTheoryParams, EbmParams};
 use image::{ImageBuffer, Rgb};
 use std::path::Path;
+use rand::Rng; 
+use std::f64::consts::FRAC_PI_4;
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════╗");
@@ -15,12 +17,19 @@ fn main() {
     let out_dir = Path::new("output");
     std::fs::create_dir_all(out_dir).expect("Failed to create output directory");
 
+    // Initialize the random number generator
+    let mut rng = rand::thread_rng();
+    
+    // Generate a random angle between -45 and +45 degrees (-pi/4 to pi/4 radians)
+    // 0.0 is perfectly West-to-East.
+    let random_wind_dir = rng.gen_range(-FRAC_PI_4..FRAC_PI_4);
+
     println!("━━━ Simulation: Orographic Rain Shadow (Linear Theory) ━━━");
 
     let lt_params = LinearTheoryParams {
         p0: 0.5,
         wind_speed: 15.0,
-        wind_direction: 0.0,
+        wind_direction: random_wind_dir,
         hw: 3000.0,
         tau_c: 1500.0,
         tau_f: 1500.0,

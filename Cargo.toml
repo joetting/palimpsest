@@ -10,6 +10,7 @@ rustfft = "6.1"
 rayon = "1.8"
 num-complex = "0.4"
 image = "0.24"
+rand = "0.8"
 
 [profile.release]
 opt-level = 3
