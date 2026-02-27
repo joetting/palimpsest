@@ -1,5 +1,5 @@
 use fastscape_rs::*;
-use fastscape_rs::erosion::StreamPowerParams;
+use fastscape_rs::erosion::{StreamPowerParams, DiffusionParams};
 use fastscape_rs::climate::{LinearTheoryParams, EbmParams};
 use image::{ImageBuffer, Rgb};
 use std::path::Path;
@@ -29,6 +29,7 @@ fn main() {
 
     let spl_params = StreamPowerParams {
         k_f: 2e-5,
+        k_f_sed: 1e-4,  // Sediment 5× more erodible than bedrock
         m: 0.5,
         n: 1.0,
         uplift_rate: 5e-4,
@@ -44,7 +45,10 @@ fn main() {
         climate: ClimateModel::LinearTheory(lt_params),
         erosion: ErosionModel::StreamPower(spl_params),
         ebm: EbmParams::default(),
-        k_d: 0.01,
+        diffusion: DiffusionParams {
+            k_d: 0.01,
+            s_c: 0.8,  // Nonlinear Roering with S_c = 0.8 (~38° angle of repose)
+        },
         enable_biogeochem: true,
         init_elevation: 0.0,
         init_perturbation: 1.0,

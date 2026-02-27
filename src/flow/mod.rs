@@ -1,13 +1,14 @@
-//! Flow routing algorithms: D-infinity (Tarboton) and D8.
+//! Flow routing with Priority-Flood depression filling and D-infinity partitioning.
 //!
-//! D∞ computes flow direction as a continuous angle on 8 triangular facets,
-//! partitioning flow proportionally between the 2 bounding cells. This eliminates
-//! the grid-aligned artifact valleys of D8 while avoiding over-dispersion of pure MFD.
-//!
-//! Also computes topological stack ordering (highest to lowest) for the implicit O(n) solver.
+//! **Critique fix #2**: Added Priority-Flood (Barnes et al., 2014) to fill topographic
+//! depressions before routing. Without this, internal pits trap water and halt upstream
+//! erosion. The algorithm uses a min-heap seeded from boundary cells to flood-fill all
+//! depressions to their spill elevation, then routes flow on the filled surface.
 
 use crate::grid::TerrainGrid;
 use crate::graph::CsrFlowGraph;
+use std::collections::BinaryHeap;
+use std::cmp::Ordering;
 
 /// 8 neighbor offsets: (drow, dcol) for N, NE, E, SE, S, SW, W, NW
 const D8_OFFSETS: [(i32, i32); 8] = [
@@ -15,52 +16,137 @@ const D8_OFFSETS: [(i32, i32); 8] = [
     (1, 0),  (1, -1), (0, -1), (-1, -1),
 ];
 
+/// Min-heap entry for Priority-Flood. BinaryHeap is a max-heap,
+/// so we reverse the ordering to get min-heap behavior.
+#[derive(PartialEq)]
+struct FloodEntry {
+    elevation: f64,
+    index: usize,
+}
+
+impl Eq for FloodEntry {}
+
+impl PartialOrd for FloodEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // Reverse: smaller elevation = higher priority
+        other.elevation.partial_cmp(&self.elevation)
+    }
+}
+
+impl Ord for FloodEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
 /// Result of flow routing computation.
 pub struct FlowRoutingResult {
-    /// Primary receiver for each node (steepest descent neighbor).
     pub receivers: Vec<usize>,
-    /// For D∞: secondary receiver (the other cell bounding the steepest facet).
-    /// Same as primary if D8 mode or flow is axis-aligned.
     pub receivers_secondary: Vec<usize>,
-    /// Fraction of flow to primary receiver [0, 1]. Secondary gets (1 - fraction).
     pub flow_fraction: Vec<f64>,
-    /// Topological stack: nodes ordered from outlet (lowest) to ridge (highest).
-    /// Processing in reverse order gives the upstream→downstream traversal needed by the solver.
     pub stack: Vec<usize>,
-    /// CSR donor graph (who flows *into* each node).
     pub donor_graph: CsrFlowGraph,
 }
 
-/// Compute D-infinity flow routing (Tarboton 1997).
+/// Priority-Flood depression filling (Barnes, Lehman & Mulla, 2014).
 ///
-/// For each interior cell, evaluates 8 triangular facets formed by the 3×3 neighborhood.
-/// The steepest downslope facet defines a continuous angle, and flow is partitioned
-/// proportionally between the two cells bounding that facet.
+/// Fills all topographic depressions (pits) so that every interior cell
+/// has at least one downslope neighbor, enabling complete drainage to boundary.
+/// Stores the filled surface in `grid.lake_level`.
+///
+/// Algorithm:
+/// 1. Seed a min-heap with all boundary cells
+/// 2. Pop the lowest cell; for each unvisited neighbor:
+///    - Set its lake_level = max(neighbor_elevation, current_lake_level)
+///    - Push to the heap
+/// 3. After processing, lake_level >= elevation everywhere, and every
+///    cell has a non-ascending path to the boundary.
+///
+/// Complexity: O(N log N) due to the heap operations.
+pub fn priority_flood_fill(grid: &mut TerrainGrid) {
+    let rows = grid.rows;
+    let cols = grid.cols;
+    let n = grid.len();
+
+    let mut visited = vec![false; n];
+    let mut filled: Vec<f64> = grid.elevation.iter().copied().collect();
+    let mut heap = BinaryHeap::new();
+
+    // Seed heap with boundary cells
+    for r in 0..rows {
+        for c in 0..cols {
+            if grid.is_boundary(r, c) {
+                let idx = grid.flat_index(r, c);
+                visited[idx] = true;
+                heap.push(FloodEntry {
+                    elevation: filled[idx],
+                    index: idx,
+                });
+            }
+        }
+    }
+
+    // Process heap
+    while let Some(entry) = heap.pop() {
+        let (r, c) = grid.grid_index(entry.index);
+
+        for &(dr, dc) in D8_OFFSETS.iter() {
+            let nr = r as i32 + dr;
+            let nc = c as i32 + dc;
+            if nr < 0 || nr >= rows as i32 || nc < 0 || nc >= cols as i32 {
+                continue;
+            }
+            let ni = grid.flat_index(nr as usize, nc as usize);
+            if visited[ni] {
+                continue;
+            }
+            visited[ni] = true;
+
+            // The filled elevation is the max of the neighbor's true elevation
+            // and the current cell's filled elevation (water level of the depression)
+            filled[ni] = filled[ni].max(entry.elevation);
+
+            heap.push(FloodEntry {
+                elevation: filled[ni],
+                index: ni,
+            });
+        }
+    }
+
+    // Store filled surface as lake_level
+    for (i, &val) in filled.iter().enumerate() {
+        let (r, c) = grid.grid_index(i);
+        grid.lake_level[[r, c]] = val;
+    }
+}
+
+/// Compute D-infinity flow routing on the depression-filled surface.
+///
+/// Routes flow on `lake_level` (not raw `elevation`) so that water in filled
+/// depressions routes to the spill point rather than being trapped.
 pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
     let n = grid.len();
     let rows = grid.rows;
     let cols = grid.cols;
-    let elev = &grid.elevation;
+
+    // Route on the filled surface
+    let elev = &grid.lake_level;
 
     let mut receivers = vec![0usize; n];
     let mut receivers_secondary = vec![0usize; n];
     let mut flow_fraction = vec![1.0f64; n];
 
-    // Initialize: each node is its own receiver (base level / pit)
     for i in 0..n {
         receivers[i] = i;
         receivers_secondary[i] = i;
     }
 
-    // For each cell, evaluate 8 triangular facets
-    // Facet k is formed by neighbor k and neighbor (k+1)%8
     for r in 0..rows {
         for c in 0..cols {
             let idx = grid.flat_index(r, c);
             let h0 = elev[[r, c]];
 
             if grid.is_boundary(r, c) {
-                // Boundary cells: receiver = self (fixed base level)
                 receivers[idx] = idx;
                 receivers_secondary[idx] = idx;
                 flow_fraction[idx] = 1.0;
@@ -82,13 +168,8 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
                 let r2 = r as i32 + dr2;
                 let c2 = c as i32 + dc2;
 
-                // Bounds check
-                if r1 < 0 || r1 >= rows as i32 || c1 < 0 || c1 >= cols as i32 {
-                    continue;
-                }
-                if r2 < 0 || r2 >= rows as i32 || c2 < 0 || c2 >= cols as i32 {
-                    continue;
-                }
+                if r1 < 0 || r1 >= rows as i32 || c1 < 0 || c1 >= cols as i32 { continue; }
+                if r2 < 0 || r2 >= rows as i32 || c2 < 0 || c2 >= cols as i32 { continue; }
 
                 let r1 = r1 as usize;
                 let c1 = c1 as usize;
@@ -100,36 +181,19 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
                 let h1 = elev[[r1, c1]];
                 let h2 = elev[[r2, c2]];
 
-                // Distance to each neighbor
                 let dist1 = ((dr1 as f64 * grid.dy).powi(2) + (dc1 as f64 * grid.dx).powi(2)).sqrt();
                 let dist2 = ((dr2 as f64 * grid.dy).powi(2) + (dc2 as f64 * grid.dx).powi(2)).sqrt();
 
-                // Slopes along the two edges of the facet
                 let s1 = (h0 - h1) / dist1;
                 let s2 = (h0 - h2) / dist2;
 
-                // Steepest direction on this triangular facet
-                // The facet subtends an angular range; find the angle of steepest descent
-                // within this facet using planar geometry.
+                if s1 <= 0.0 && s2 <= 0.0 { continue; }
 
-                // Angular span of the facet
-                let _angle1 = (dr1 as f64).atan2(dc1 as f64);
-                let _angle2 = (dr2 as f64).atan2(dc2 as f64);
-
-                // Simple approach: steepest gradient on the planar triangle
-                // If both neighbors are downslope, partition proportionally
-                if s1 <= 0.0 && s2 <= 0.0 {
-                    continue; // Both neighbors are upslope; skip this facet
-                }
-
-                // Effective slope: maximum of the planar interpolation
                 let slope_mag;
                 let frac;
 
                 if s1 > 0.0 && s2 > 0.0 {
-                    // Both downslope: compute steepest direction on the facet
                     slope_mag = (s1 * s1 + s2 * s2).sqrt();
-                    // Partition: fraction to neighbor 1 proportional to its slope
                     frac = s1 / (s1 + s2);
                 } else if s1 > 0.0 {
                     slope_mag = s1;
@@ -153,11 +217,7 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
         }
     }
 
-    // Build donor graph via CSR from receivers
     let donor_graph = CsrFlowGraph::from_receivers(&receivers);
-
-    // Compute topological stack ordering using Braun & Willett algorithm.
-    // Process from base level upward (BFS from outlets).
     let stack = compute_stack_order(&receivers, n);
 
     FlowRoutingResult {
@@ -169,10 +229,7 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
     }
 }
 
-/// Compute topological stack order: outlets first, then upstream nodes.
-/// This is the Braun & Willett (2013) ordering used by the implicit O(n) solver.
 fn compute_stack_order(receivers: &[usize], n: usize) -> Vec<usize> {
-    // Build donor lists
     let mut donors: Vec<Vec<usize>> = vec![vec![]; n];
     for (i, &recv) in receivers.iter().enumerate() {
         if recv != i {
@@ -180,18 +237,15 @@ fn compute_stack_order(receivers: &[usize], n: usize) -> Vec<usize> {
         }
     }
 
-    // BFS/DFS from base-level nodes (self-receivers)
     let mut stack = Vec::with_capacity(n);
     let mut visited = vec![false; n];
 
-    // Start with outlets (nodes that receive to themselves)
     let mut queue: Vec<usize> = (0..n).filter(|&i| receivers[i] == i).collect();
     for &node in &queue {
         visited[node] = true;
     }
     stack.extend_from_slice(&queue);
 
-    // Process queue
     let mut head = 0;
     while head < queue.len() {
         let node = queue[head];
@@ -208,24 +262,11 @@ fn compute_stack_order(receivers: &[usize], n: usize) -> Vec<usize> {
     stack
 }
 
-/// Compute drainage area and effective discharge using the stack ordering.
-/// Traverses upstream → downstream (reverse stack), accumulating area and precipitation.
-pub fn accumulate_flow(
-    grid: &mut TerrainGrid,
-    routing: &FlowRoutingResult,
-) {
+/// Compute drainage area and effective discharge on the filled surface.
+pub fn accumulate_flow(grid: &mut TerrainGrid, routing: &FlowRoutingResult) {
     let n = grid.len();
     let cell_area = grid.dx * grid.dy;
 
-    // Reset
-    for val in grid.drainage_area.iter_mut() {
-        *val = cell_area;
-    }
-    for val in grid.discharge.iter_mut() {
-        *val = 0.0;
-    }
-
-    // Initialize discharge with local precipitation × cell area
     let precip_flat: Vec<f64> = grid.precipitation.iter().copied().collect();
     let mut discharge_flat = vec![0.0f64; n];
     let mut area_flat = vec![cell_area; n];
@@ -234,14 +275,12 @@ pub fn accumulate_flow(
         discharge_flat[i] = precip_flat[i] * cell_area;
     }
 
-    // Traverse from ridges to outlets (reverse stack order)
     for &node in routing.stack.iter().rev() {
         let recv1 = routing.receivers[node];
         let recv2 = routing.receivers_secondary[node];
         let frac = routing.flow_fraction[node];
 
         if recv1 != node {
-            // D∞ partitioning: split flow between primary and secondary receiver
             area_flat[recv1] += area_flat[node] * frac;
             discharge_flat[recv1] += discharge_flat[node] * frac;
 
@@ -252,7 +291,6 @@ pub fn accumulate_flow(
         }
     }
 
-    // Write back to grid
     for (i, val) in area_flat.iter().enumerate() {
         let (r, c) = grid.grid_index(i);
         grid.drainage_area[[r, c]] = *val;
@@ -263,7 +301,7 @@ pub fn accumulate_flow(
     }
 }
 
-/// Compute local slope at each cell using central differences.
+/// Compute local slope at each cell.
 pub fn compute_slopes(grid: &mut TerrainGrid) {
     let rows = grid.rows;
     let cols = grid.cols;
