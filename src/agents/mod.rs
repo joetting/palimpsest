@@ -151,7 +151,7 @@ impl AgentPopulation {
             // === BELIEFS: Observe local environment ===
             let local_soil = grid.soil_state[[agent.row, agent.col]];
             let local_precip = grid.precipitation[[agent.row, agent.col]];
-            let local_slope = grid.slope[[agent.row, agent.col]];
+            let _local_slope = grid.slope[[agent.row, agent.col]];
             let local_carbon = grid.soil_carbon[[agent.row, agent.col]];
 
             // Fertility perception: rich soil + water + organic matter
@@ -270,21 +270,25 @@ impl AgentPopulation {
         self.agents.retain(|a| a.energy > 0.0);
 
         // Occasional reproduction if population is healthy
+        let rng = &mut self.rng;
         let new_agents: Vec<BdiAgent> = self.agents.iter()
             .filter(|a| a.energy > 0.8 && a.age > 10)
-            .filter(|_| self.rng.gen::<f64>() < 0.01)
-            .map(|parent| {
-                let dr: i32 = self.rng.gen_range(-2..=2);
-                let dc: i32 = self.rng.gen_range(-2..=2);
-                let nr = (parent.row as i32 + dr).clamp(1, (rows - 2) as i32) as usize;
-                let nc = (parent.col as i32 + dc).clamp(1, (cols - 2) as i32) as usize;
-                BdiAgent {
-                    row: nr,
-                    col: nc,
-                    kind: parent.kind,
-                    energy: 0.5,
-                    persistence: parent.persistence,
-                    age: 0,
+            .filter_map(|parent| {
+                if rng.gen::<f64>() < 0.01 {
+                    let dr: i32 = rng.gen_range(-2..=2);
+                    let dc: i32 = rng.gen_range(-2..=2);
+                    let nr = (parent.row as i32 + dr).clamp(1, (rows - 2) as i32) as usize;
+                    let nc = (parent.col as i32 + dc).clamp(1, (cols - 2) as i32) as usize;
+                    Some(BdiAgent {
+                        row: nr,
+                        col: nc,
+                        kind: parent.kind,
+                        energy: 0.5,
+                        persistence: parent.persistence,
+                        age: 0,
+                    })
+                } else {
+                    None
                 }
             })
             .collect();
