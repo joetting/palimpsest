@@ -2,7 +2,7 @@ use fastscape_rs::*;
 use fastscape_rs::erosion::{StreamPowerParams, DiffusionParams};
 use fastscape_rs::climate::{LinearTheoryParams, EbmParams};
 use fastscape_rs::pedogenesis::PedogenesisParams;
-use fastscape_rs::agents::AgentParams;
+use fastscape_rs::agents::LandUseParams;
 use image::{ImageBuffer, Rgb};
 use std::path::Path;
 use rand::Rng;
@@ -10,10 +10,10 @@ use std::f64::consts::FRAC_PI_4;
 
 fn main() {
     println!("================================================================");
-    println!("  fastscape-rs v0.2");
-    println!("  Nonlinear Pedogenesis + BDI Agents + Multi-Scale Coupling");
-    println!("  Solutions: Variable K_d | On-the-fly K_f | eps-regularized dR/dt");
-    println!("             Influence Maps | Temporal Sub-Stepping");
+    println!("  fastscape-rs v0.3");
+    println!("  Corrected Biogeomorphic Coupling");
+    println!("  Fixes: Tool&Cover | Implicit ADI K_d | Michaelis-Menten dR/dt");
+    println!("         Markov Regimes | Fisher-KPP Population");
     println!("================================================================");
     println!();
 
@@ -39,7 +39,7 @@ fn main() {
         m: 0.5,
         n: 1.0,
         uplift_rate: 5e-4,
-        alpha_erodibility: 0.5, // Solution #2: K_f / (1 + 0.5*S)
+        h_star: 0.5,
     };
 
     let config = SimulationConfig {
@@ -55,37 +55,32 @@ fn main() {
         diffusion: DiffusionParams {
             k_d: 0.01,
             s_c: 0.8,
-            beta_diffusivity: 0.3, // Solution #1: K_d * (1 + 0.3*S)
+            beta_diffusivity: 0.3,
         },
         pedogenesis: PedogenesisParams {
             c1: 0.005,
             k1: 0.1,
             c2: 0.003,
-            k2: 0.5,
-            epsilon: 0.01,       // Solution #3
-            s_min: 0.05,         // Solution #3
+            k_m: 0.05,
             erosion_coupling: 1.0,
-            bio_progressive_coupling: 1.0,
-            bio_regressive_coupling: 1.0,
+            regime_progressive_coupling: 1.0,
+            regime_regressive_coupling: 1.0,
         },
-        agents: AgentParams {
-            initial_count: 300,
-            dt_bio: 1.0,
-            representative_steps: 100, // Solution #5: 100 repr. steps per macro dt
-            perception_radius: 3,
-            move_probability: 0.3,
-            grazing_intensity: 0.002,
-            decomposition_intensity: 0.003,
-            farming_progressive: 0.002,
-            farming_regressive: 0.001,
-            forester_progressive: 0.004,
-            hunger_threshold: 0.3,
-            energy_recovery: 0.1,
-            energy_cost: 0.02,
+        land_use: LandUseParams {
+            growth_rate: 0.03,
+            diffusion_coeff: 5000.0,
+            base_carrying_capacity: 1.0,
+            threshold_graze: 0.15,
+            threshold_intensive: 0.5,
+            soil_degradation_threshold: 0.1,
+            recovery_rate: 0.001,
+            catastrophic_prob: 0.01,
+            initial_density: 0.0,
+            seed_count: 10,
         },
         enable_biogeochem: true,
         enable_pedogenesis: true,
-        enable_agents: true,
+        enable_land_use: true,
         init_elevation: 0.0,
         init_perturbation: 1.0,
         seed: 12345,
@@ -114,7 +109,13 @@ fn main() {
     println!("  -> soil_carbon.png");
 
     save_soil_state_png(&grid, &out_dir.join("soil_state.png"));
-    println!("  -> soil_state.png (pedodiversity)");
+    println!("  -> soil_state.png");
+
+    save_land_use_png(&grid, &out_dir.join("land_use.png"));
+    println!("  -> land_use.png");
+
+    save_population_png(&grid, &out_dir.join("population.png"));
+    println!("  -> population.png");
 
     save_timeseries_png(&diagnostics, &out_dir.join("timeseries.png"));
     println!("  -> timeseries.png");
@@ -127,7 +128,9 @@ fn main() {
         println!("  Mean erosion rate:  {:.6} m/yr", d.mean_erosion_rate);
         println!("  Mean soil state S:  {:.4}", d.mean_soil_state);
         println!("  Max soil state S:   {:.4}", d.max_soil_state);
-        println!("  Living agents:      {}", d.agent_count);
+        println!("  Mean population:    {:.4}", d.mean_population);
+        println!("  Regimes: Pristine={} Grazed={} Intensive={} Degraded={}",
+            d.regime_counts[0], d.regime_counts[1], d.regime_counts[2], d.regime_counts[3]);
     }
 
     println!("\nAll outputs saved to ./output/");
@@ -174,7 +177,6 @@ fn carbon_colormap(t: f64) -> Rgb<u8> {
     Rgb([r as u8, g as u8, b as u8])
 }
 
-/// Soil state colormap: low S = bare rock (grey) → high S = rich soil (deep brown/green)
 fn soil_state_colormap(t: f64) -> Rgb<u8> {
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t < 0.2 {
@@ -281,6 +283,37 @@ fn save_soil_state_png(grid: &grid::TerrainGrid, path: &Path) {
     img.save(path).expect("Failed to save soil state PNG");
 }
 
+fn save_land_use_png(grid: &grid::TerrainGrid, path: &Path) {
+    let (rows, cols) = (grid.rows, grid.cols);
+    let img = ImageBuffer::from_fn(cols as u32, rows as u32, |x, y| {
+        match grid.land_use[[y as usize, x as usize]] {
+            0 => Rgb([20u8, 120, 40]),    // Pristine: deep green
+            1 => Rgb([180, 200, 60]),      // Grazed: yellow-green
+            2 => Rgb([200, 140, 40]),      // Intensive: orange-brown
+            3 => Rgb([160, 100, 80]),      // Degraded: dusty brown
+            _ => Rgb([128, 128, 128]),
+        }
+    });
+    img.save(path).expect("Failed to save land use PNG");
+}
+
+fn save_population_png(grid: &grid::TerrainGrid, path: &Path) {
+    let (rows, cols) = (grid.rows, grid.cols);
+    let max = grid.population_density.iter().cloned().fold(0.0f64, f64::max).max(1e-10);
+    let img = ImageBuffer::from_fn(cols as u32, rows as u32, |x, y| {
+        let t = (grid.population_density[[y as usize, x as usize]] / max).clamp(0.0, 1.0);
+        let (r, g, b) = if t < 0.3 {
+            lerp3((10.0, 10.0, 30.0), (80.0, 40.0, 120.0), t / 0.3)
+        } else if t < 0.7 {
+            lerp3((80.0, 40.0, 120.0), (220.0, 120.0, 40.0), (t - 0.3) / 0.4)
+        } else {
+            lerp3((220.0, 120.0, 40.0), (255.0, 240.0, 180.0), (t - 0.7) / 0.3)
+        };
+        Rgb([r as u8, g as u8, b as u8])
+    });
+    img.save(path).expect("Failed to save population PNG");
+}
+
 fn save_timeseries_png(diagnostics: &[StepDiagnostics], path: &Path) {
     let w: u32 = 800;
     let h: u32 = 400;
@@ -298,7 +331,6 @@ fn save_timeseries_png(diagnostics: &[StepDiagnostics], path: &Path) {
     let t_max = diagnostics.last().map(|d| d.time).unwrap_or(1.0);
     let h_max_val = diagnostics.iter().map(|d| d.max_elevation).fold(0.0f64, f64::max).max(1.0);
 
-    // Axes
     for x in margin..=(w - margin) { img.put_pixel(x, h - margin, Rgb([0, 0, 0])); }
     for y in margin..=(h - margin) { img.put_pixel(margin, y, Rgb([0, 0, 0])); }
 
@@ -320,7 +352,7 @@ fn save_timeseries_png(diagnostics: &[StepDiagnostics], path: &Path) {
         prev = Some((px, py));
     }
 
-    // Mean soil state (brown, scaled separately)
+    // Mean soil state (brown)
     let s_max = diagnostics.iter().map(|d| d.max_soil_state).fold(0.0f64, f64::max).max(1e-10);
     prev = None;
     for d in diagnostics {
@@ -330,12 +362,23 @@ fn save_timeseries_png(diagnostics: &[StepDiagnostics], path: &Path) {
         prev = Some((px, py));
     }
 
+    // Mean population (purple)
+    let p_max = diagnostics.iter().map(|d| d.mean_population).fold(0.0f64, f64::max).max(1e-10);
+    prev = None;
+    for d in diagnostics {
+        let px = margin + ((d.time / t_max) * plot_w as f64) as u32;
+        let py = h - margin - ((d.mean_population / p_max) * plot_h as f64).min(plot_h as f64) as u32;
+        if let Some((px0, py0)) = prev { draw_line(&mut img, px0, py0, px, py, Rgb([120, 40, 160])); }
+        prev = Some((px, py));
+    }
+
     // Legend
     for dx in 0..12u32 {
         for dy in 0..6u32 {
             img.put_pixel(margin + 10 + dx, margin + 10 + dy, Rgb([200, 40, 40]));
             img.put_pixel(margin + 10 + dx, margin + 22 + dy, Rgb([40, 80, 200]));
             img.put_pixel(margin + 10 + dx, margin + 34 + dy, Rgb([120, 80, 30]));
+            img.put_pixel(margin + 10 + dx, margin + 46 + dy, Rgb([120, 40, 160]));
         }
     }
 

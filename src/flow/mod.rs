@@ -30,7 +30,6 @@ impl Ord for FloodEntry {
     }
 }
 
-/// Result of flow routing computation.
 pub struct FlowRoutingResult {
     pub receivers: Vec<usize>,
     pub receivers_secondary: Vec<usize>,
@@ -39,7 +38,6 @@ pub struct FlowRoutingResult {
     pub donor_graph: CsrFlowGraph,
 }
 
-/// Priority-Flood depression filling (Barnes, Lehman & Mulla, 2014).
 pub fn priority_flood_fill(grid: &mut TerrainGrid) {
     let rows = grid.rows;
     let cols = grid.cols;
@@ -54,33 +52,22 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
             if grid.is_boundary(r, c) {
                 let idx = grid.flat_index(r, c);
                 visited[idx] = true;
-                heap.push(FloodEntry {
-                    elevation: filled[idx],
-                    index: idx,
-                });
+                heap.push(FloodEntry { elevation: filled[idx], index: idx });
             }
         }
     }
 
     while let Some(entry) = heap.pop() {
         let (r, c) = grid.grid_index(entry.index);
-
         for &(dr, dc) in D8_OFFSETS.iter() {
             let nr = r as i32 + dr;
             let nc = c as i32 + dc;
-            if nr < 0 || nr >= rows as i32 || nc < 0 || nc >= cols as i32 {
-                continue;
-            }
+            if nr < 0 || nr >= rows as i32 || nc < 0 || nc >= cols as i32 { continue; }
             let ni = grid.flat_index(nr as usize, nc as usize);
-            if visited[ni] {
-                continue;
-            }
+            if visited[ni] { continue; }
             visited[ni] = true;
             filled[ni] = filled[ni].max(entry.elevation);
-            heap.push(FloodEntry {
-                elevation: filled[ni],
-                index: ni,
-            });
+            heap.push(FloodEntry { elevation: filled[ni], index: ni });
         }
     }
 
@@ -90,22 +77,17 @@ pub fn priority_flood_fill(grid: &mut TerrainGrid) {
     }
 }
 
-/// Compute D-infinity flow routing on the depression-filled surface.
 pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
     let n = grid.len();
     let rows = grid.rows;
     let cols = grid.cols;
-
     let elev = &grid.lake_level;
 
     let mut receivers = vec![0usize; n];
     let mut receivers_secondary = vec![0usize; n];
     let mut flow_fraction = vec![1.0f64; n];
 
-    for i in 0..n {
-        receivers[i] = i;
-        receivers_secondary[i] = i;
-    }
+    for i in 0..n { receivers[i] = i; receivers_secondary[i] = i; }
 
     for r in 0..rows {
         for c in 0..cols {
@@ -137,10 +119,8 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
                 if r1 < 0 || r1 >= rows as i32 || c1 < 0 || c1 >= cols as i32 { continue; }
                 if r2 < 0 || r2 >= rows as i32 || c2 < 0 || c2 >= cols as i32 { continue; }
 
-                let r1 = r1 as usize;
-                let c1 = c1 as usize;
-                let r2 = r2 as usize;
-                let c2 = c2 as usize;
+                let r1 = r1 as usize; let c1 = c1 as usize;
+                let r2 = r2 as usize; let c2 = c2 as usize;
                 let idx1 = grid.flat_index(r1, c1);
                 let idx2 = grid.flat_index(r2, c2);
 
@@ -155,19 +135,13 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
 
                 if s1 <= 0.0 && s2 <= 0.0 { continue; }
 
-                let slope_mag;
-                let frac;
-
-                if s1 > 0.0 && s2 > 0.0 {
-                    slope_mag = (s1 * s1 + s2 * s2).sqrt();
-                    frac = s1 / (s1 + s2);
+                let (slope_mag, frac) = if s1 > 0.0 && s2 > 0.0 {
+                    ((s1 * s1 + s2 * s2).sqrt(), s1 / (s1 + s2))
                 } else if s1 > 0.0 {
-                    slope_mag = s1;
-                    frac = 1.0;
+                    (s1, 1.0)
                 } else {
-                    slope_mag = s2;
-                    frac = 0.0;
-                }
+                    (s2, 0.0)
+                };
 
                 if slope_mag > max_slope {
                     max_slope = slope_mag;
@@ -186,30 +160,19 @@ pub fn route_flow_dinf(grid: &TerrainGrid) -> FlowRoutingResult {
     let donor_graph = CsrFlowGraph::from_receivers(&receivers);
     let stack = compute_stack_order(&receivers, n);
 
-    FlowRoutingResult {
-        receivers,
-        receivers_secondary,
-        flow_fraction,
-        stack,
-        donor_graph,
-    }
+    FlowRoutingResult { receivers, receivers_secondary, flow_fraction, stack, donor_graph }
 }
 
 fn compute_stack_order(receivers: &[usize], n: usize) -> Vec<usize> {
     let mut donors: Vec<Vec<usize>> = vec![vec![]; n];
     for (i, &recv) in receivers.iter().enumerate() {
-        if recv != i {
-            donors[recv].push(i);
-        }
+        if recv != i { donors[recv].push(i); }
     }
 
     let mut stack = Vec::with_capacity(n);
     let mut visited = vec![false; n];
-
     let mut queue: Vec<usize> = (0..n).filter(|&i| receivers[i] == i).collect();
-    for &node in &queue {
-        visited[node] = true;
-    }
+    for &node in &queue { visited[node] = true; }
     stack.extend_from_slice(&queue);
 
     let mut head = 0;
@@ -224,11 +187,9 @@ fn compute_stack_order(receivers: &[usize], n: usize) -> Vec<usize> {
             }
         }
     }
-
     stack
 }
 
-/// Compute drainage area and effective discharge on the filled surface.
 pub fn accumulate_flow(grid: &mut TerrainGrid, routing: &FlowRoutingResult) {
     let n = grid.len();
     let cell_area = grid.dx * grid.dy;
@@ -237,9 +198,7 @@ pub fn accumulate_flow(grid: &mut TerrainGrid, routing: &FlowRoutingResult) {
     let mut discharge_flat = vec![0.0f64; n];
     let mut area_flat = vec![cell_area; n];
 
-    for i in 0..n {
-        discharge_flat[i] = precip_flat[i] * cell_area;
-    }
+    for i in 0..n { discharge_flat[i] = precip_flat[i] * cell_area; }
 
     for &node in routing.stack.iter().rev() {
         let recv1 = routing.receivers[node];
@@ -249,7 +208,6 @@ pub fn accumulate_flow(grid: &mut TerrainGrid, routing: &FlowRoutingResult) {
         if recv1 != node {
             area_flat[recv1] += area_flat[node] * frac;
             discharge_flat[recv1] += discharge_flat[node] * frac;
-
             if recv2 != node && recv2 != recv1 {
                 area_flat[recv2] += area_flat[node] * (1.0 - frac);
                 discharge_flat[recv2] += discharge_flat[node] * (1.0 - frac);
@@ -267,7 +225,6 @@ pub fn accumulate_flow(grid: &mut TerrainGrid, routing: &FlowRoutingResult) {
     }
 }
 
-/// Compute local slope at each cell.
 pub fn compute_slopes(grid: &mut TerrainGrid) {
     let rows = grid.rows;
     let cols = grid.cols;
@@ -276,10 +233,7 @@ pub fn compute_slopes(grid: &mut TerrainGrid) {
 
     for r in 0..rows {
         for c in 0..cols {
-            if grid.is_boundary(r, c) {
-                grid.slope[[r, c]] = 0.0;
-                continue;
-            }
+            if grid.is_boundary(r, c) { grid.slope[[r, c]] = 0.0; continue; }
             let dhdx = (grid.elevation[[r, c + 1]] - grid.elevation[[r, c - 1]]) / (2.0 * dx);
             let dhdy = (grid.elevation[[r + 1, c]] - grid.elevation[[r - 1, c]]) / (2.0 * dy);
             grid.slope[[r, c]] = (dhdx * dhdx + dhdy * dhdy).sqrt();
